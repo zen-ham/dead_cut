@@ -1,50 +1,49 @@
-# dead_cut
+Auto-edit long YouTube vods into tight cuts of just the entertaining bits.
+=
 
-Automated pipeline that turns a long, lightly-edited YouTube vod into a tight cut of the entertaining parts.
+![lastcommit](https://img.shields.io/github/last-commit/zen-ham/dead_cut) ![python](https://img.shields.io/badge/python-3.10+-blue) ![ffmpeg](https://img.shields.io/badge/ffmpeg-required-green) ![GPU](https://img.shields.io/badge/NVIDIA_GPU-recommended-76b900)
 
-## Pipeline
+<p align="center">
+    <img src="https://github.com/zen-ham/dead_cut/blob/master/repo_assets/logo.svg" width="90%" />
+</p>
 
-1. **Download** the source video with `yt-dlp` (mp4, audio + video).
-2. **Transcribe** the audio with `faster-whisper`, producing word-level timestamps.
-3. **Loudness-analyze** the audio: peak + duration of loud spikes per transcript segment, used as an entertainment proxy.
-4. **Cut detection** via OpenRouter (free models, fallback chain). The LLM receives the timestamped transcript + per-segment loudness and returns ranges to **remove**. Prompt is strict: cut-only output, never "keep" ranges.
-5. **Trim** with `ffmpeg` using stream-copy concat for speed and zero re-encode loss.
+---
+Technical details:
+-
 
-Intermediate artifacts (download, transcript, loudness) are cached per video ID so re-iterating on the prompt is cheap.
+Point this at a 27-minute vod, get back a 9-minute cut. Point it at a 45-minute stream, get back 11 minutes of the actually-entertaining bits. One command, fully hands-off, runs end-to-end on a free OpenRouter model with no API costs.
 
-## Setup
+The pipeline downloads with `yt-dlp` (auto-pulls cookies from Firefox/Chrome/Edge to bypass YouTube's bot check), transcribes with `faster-whisper` running batched `int8_float16` on GPU at ~16x realtime (small model + `BatchedInferencePipeline(batch_size=8)` — benchmarked the alternatives, this won), then computes per-segment loudness so every transcript line in the prompt is annotated with peak dB, mean dB, and a loud-fraction so the model has an audio-energy hint for which sections are likely entertaining. The annotated transcript gets fed to a free OpenRouter model (`gpt-oss-120b:free` by default, with fallback chain) under a carefully-tuned prompt that requires the model to enumerate specific highlights *before* emitting cut ranges — without that forcing function, the model lazily chunks the runtime into equal blocks instead of actually engaging with the content (observed on iter 0 of the very first test, cut 90% of the video in one block).
 
-1. `pip install -r requirements.txt`
-2. Install `ffmpeg` (must be on PATH).
-3. Provide an OpenRouter API key (free tier is fine). Either:
-   - Set `OPENROUTER_API_KEY` in your environment, OR
-   - Put the key on a single line in `openrouter_token.txt` in the parent
-     directory of this repo (one level above `dead_cut/`).
-4. YouTube now requires cookies for most downloads. The downloader auto-loads
-   them from a locally-installed Firefox / Chrome / Edge profile via `yt-dlp`'s
-   `cookies-from-browser`. If none of those are installed, downloads will fail
-   on the bot-check.
+The raw LLM cut ranges then go through two post-processing stages that nobody told the model about. First, **snap-to-silence**: each cut boundary moves to the nearest actual silence in the waveform within ±2s, so cuts land between words instead of mid-sentence — transcript-segment boundaries are NOT word boundaries, and the LLM has no way to know that. The silence threshold is derived from the median loudness of the speech segments themselves (not the overall track mean, which gets pulled around by silence ratio and background music). Second, **in-keep silence trim**: each keep range is scanned for internal silences >0.6s and they get compressed to a 0.4s gap — this kills the 15-second walking-around stretches inside an otherwise-kept clip that the LLM can't see at segment-aggregate resolution. On the test vod this removed an additional 8 minutes of dead air on top of the LLM's macro cuts.
 
-## Usage
+Final output is built with a single `ffmpeg` pass: `select` filter for video (one filter regardless of cut count), per-range `atrim+concat` for audio, encoded by `h264_nvenc` preset p1 with `libx264` fallback. Sample-precise output duration — no keyframe drift across hundreds of micro-cuts (which is what kills the stream-copy approach that I tried first; 221 stream-copy cuts on the test vod accumulated ~10 minutes of drift before I caught it).
 
-```bash
-python -m dead_cut https://www.youtube.com/watch?v=Ur6X9be0CO8
+Speed on a GTX 1660 Ti:
+- 27-min vod → ~5 min total
+- 45-min vod → ~10 min total
+- 3-hour vod → ~30 min total
+
+Usage:
+-
+
+```
+python -m dead_cut "https://www.youtube.com/watch?v=ID"
 ```
 
-Output written to `cache/<video_id>/final.mp4`. Each pipeline stage caches its
-output, so re-running with `--iter N` (any number you haven't used before) will
-re-call only the LLM and ffmpeg — download/transcribe/loudness stay cached.
+Output lands at `cache/<video_id>/final.mp4`. Every pipeline stage caches its result keyed by video ID, so re-runs with the same URL skip the slow parts — download, transcribe, loudness, all reused. Bump `--iter N` to re-call the LLM with the same cached upstream data (cheap to iterate on prompt changes or to compare different models). Other flags worth knowing:
 
-```bash
-python -m dead_cut <url> --iter 2                 # try a new cut on cached transcript
-python -m dead_cut <url> --iter 2 --model qwen/qwen3.6-plus:free   # try another model
-python -m dead_cut <url> --iter 2 --dry-run        # call LLM, skip ffmpeg
-python -m dead_cut.judge <video_id> 2              # print synthesized kept transcript
+```
+--iter N             re-call LLM with cached transcribe/loudness, new iter cache key
+--model qwen/qwen3.6-plus:free    force a specific OpenRouter model
+--no-trim            disable within-keep silence trim (keeps looser pacing)
+--no-snap            disable cut-boundary snap-to-silence
+--dry-run            run through LLM but skip ffmpeg
 ```
 
-## Dependencies
+Setup:
+-
 
-- Python 3.10+
-- `ffmpeg` on PATH
-- NVIDIA GPU + CUDA optional but ~10x faster transcribe (CPU fallback auto)
-- See `requirements.txt`
+`pip install -r requirements.txt` (yt-dlp, faster-whisper, numpy, soundfile, requests, tqdm), `ffmpeg` on PATH, and either set `OPENROUTER_API_KEY` in your env or drop a free OpenRouter key on a single line in `openrouter_token.txt` in the parent directory of the repo (token is loaded from there, never committed).
+
+NVIDIA GPU is not required but the speed numbers above assume CUDA. CPU fallback works, just slower — transcribe drops from ~16x realtime to ~1x.
