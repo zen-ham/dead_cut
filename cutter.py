@@ -264,6 +264,11 @@ def _cut_reencode(
         "-map", "[outv]", "-map", "1:a",
         *enc_args,
         "-c:a", "aac", "-b:a", "192k",
+        # +faststart moves the moov atom to the start of the file so video
+        # players don't need to seek to the end to read metadata. Doesn't
+        # rescue mid-encode-killed files (moov still gets written at finish)
+        # but helps streaming and tool compatibility.
+        "-movflags", "+faststart",
         output_path,
     ]
     total_keep = sum(e - s for s, e in keep_ranges)

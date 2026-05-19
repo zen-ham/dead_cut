@@ -13,11 +13,19 @@ def download(url: str, video_id: str) -> str:
         print(f"[download] cache hit: {out_path}")
         return out_path
 
-    # Selector left format-agnostic for the video stream; merge_output_format
-    # re-muxes to mp4 if the chosen video is webm/etc. mp4-only selectors break
-    # on streams where YouTube only offers webm at the desired resolution.
+    # PREFER H.264 (vcodec=avc1) over AV1/VP9. YouTube serves AV1 as
+    # "best video" for most modern uploads, but AV1 has NO hardware decoder
+    # on Turing GPUs (GTX 16xx, RTX 20xx) and only partial support on Ampere.
+    # CPU-decoding 3 hours of AV1 through a select filter is the difference
+    # between a 5-min and a 40-min encode. The selector falls back to AV1
+    # only when no H.264 stream is offered.
     ydl_opts = {
-        "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+        "format": (
+            "bestvideo[height<=720][vcodec^=avc1]+bestaudio/"
+            "bestvideo[height<=720][vcodec^=h264]+bestaudio/"
+            "bestvideo[height<=720]+bestaudio/"
+            "best[height<=720]/best"
+        ),
         "outtmpl": os.path.join(out_dir, "source.%(ext)s"),
         "merge_output_format": "mp4",
         "quiet": False,
