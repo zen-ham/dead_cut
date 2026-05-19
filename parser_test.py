@@ -1,6 +1,6 @@
 """Test the parser handles the LLM output formats we expect, plus the
 adversarial cases the user warned about."""
-from .parser import parse_cuts, cuts_to_keeps, snap_cuts_to_silence
+from .parser import parse_cuts, cuts_to_keeps, snap_cuts_to_silence, trim_silences_within_keeps
 
 
 def _expect(actual, expected, label):
@@ -147,6 +147,36 @@ def run():
     r = snap_cuts_to_silence(cuts, silences, tolerance_s=2.0)
     # cut1 end snaps 20.0 -> 21.2, cut2 start snaps 21.0 -> 19.5, then merge
     _expect(r, [(10.0, 30.0)], "overlapping snaps merge")
+
+    # 16. trim_silences_within_keeps: 15s silence inside a keep gets compressed.
+    keeps = [(100.0, 200.0)]
+    silences = [[120.0, 135.0]]  # 15s silence inside keep
+    r = trim_silences_within_keeps(keeps, silences, max_silence_s=0.6, padding_s=0.2)
+    # Skip range = (120+0.2, 135-0.2) = (120.2, 134.8); sub-keeps split around it
+    _expect(r, [(100.0, 120.2), (134.8, 200.0)], "long inner silence compressed")
+
+    # 17. Short silence inside keep stays untouched.
+    keeps = [(100.0, 200.0)]
+    silences = [[120.0, 120.4]]  # 0.4s — below threshold
+    r = trim_silences_within_keeps(keeps, silences, max_silence_s=0.6, padding_s=0.2)
+    _expect(r, [(100.0, 200.0)], "short inner silence preserved")
+
+    # 18. Silence overlapping keep boundary is clipped first then evaluated.
+    keeps = [(100.0, 200.0)]
+    silences = [[195.0, 220.0]]  # 25s silence, but only 5s inside keep
+    r = trim_silences_within_keeps(keeps, silences, max_silence_s=0.6, padding_s=0.2)
+    # Clipped to (195, 200) = 5s, exceeds threshold. Skip = (195.2, 199.8).
+    _expect(r, [(100.0, 195.2), (199.8, 200.0)], "boundary-crossing silence clipped")
+
+    # 19. Multiple long silences in one keep produce multiple sub-keeps.
+    keeps = [(0.0, 100.0)]
+    silences = [[20.0, 30.0], [60.0, 75.0]]
+    r = trim_silences_within_keeps(keeps, silences, max_silence_s=0.6, padding_s=0.2)
+    _expect(r, [(0.0, 20.2), (29.8, 60.2), (74.8, 100.0)], "multiple inner silences split")
+
+    # 20. No silences = no-op.
+    r = trim_silences_within_keeps([(0.0, 100.0)], [], max_silence_s=0.6, padding_s=0.2)
+    _expect(r, [(0.0, 100.0)], "no silences = no-op")
 
     print("[parser_test] ALL PASS")
 

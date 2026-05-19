@@ -16,10 +16,12 @@ def main():
                     help="Force a specific OpenRouter model id (e.g. qwen/qwen3.6-plus:free)")
     ap.add_argument("--no-snap", action="store_true",
                     help="Disable snap-to-silence post-process (for A/B comparison)")
+    ap.add_argument("--no-trim", action="store_true",
+                    help="Disable within-keep silence trim (keeps original pacing)")
     args = ap.parse_args()
     try:
         run(args.url, iteration=args.iter, dry_run=args.dry_run,
-            force_model=args.model, snap=not args.no_snap)
+            force_model=args.model, snap=not args.no_snap, trim=not args.no_trim)
     except KeyboardInterrupt:
         print("\n[main] interrupted")
         sys.exit(130)

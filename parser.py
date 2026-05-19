@@ -137,6 +137,63 @@ def snap_cuts_to_silence(
     return _merge(snapped)
 
 
+def trim_silences_within_keeps(
+    keeps: List[Tuple[float, float]],
+    silences: List[List[float]],
+    max_silence_s: float = 0.6,
+    padding_s: float = 0.2,
+) -> List[Tuple[float, float]]:
+    """Compress long silences that fall INSIDE keep ranges. The LLM does macro
+    cuts well but can't see fine-grained dead air between sentences/words within
+    a keep — e.g. a 15s walking-around silence between two spoken lines. We
+    detect each silence (start, end) that overlaps a keep, and if it exceeds
+    max_silence_s, we convert (start+padding_s, end-padding_s) into a skip,
+    leaving padding_s of breathing room on each side of the surrounding speech.
+
+    Args:
+      keeps: original keep ranges (post-snap, pre-trim).
+      silences: list of [start, end] silence intervals from loudness analysis.
+      max_silence_s: silences shorter than this stay intact (preserves natural
+        rhythm — typical inter-sentence pauses are 0.2-0.8s).
+      padding_s: how much silence to leave at each end of the surrounding speech.
+        Effective minimum trimmed-silence gap = 2 * padding_s.
+
+    Returns:
+      new list of keep ranges; same as input if no qualifying silences.
+    """
+    if not silences or not keeps:
+        return keeps
+    silence_list = sorted([(s[0], s[1]) for s in silences])
+    new_keeps: List[Tuple[float, float]] = []
+    for ks, ke in keeps:
+        # Build the list of "skip" ranges inside this keep.
+        skips: List[Tuple[float, float]] = []
+        for ss, se in silence_list:
+            if se <= ks or ss >= ke:
+                continue  # no overlap
+            ss_clip = max(ss, ks)
+            se_clip = min(se, ke)
+            if se_clip - ss_clip < max_silence_s:
+                continue  # too short to compress
+            skip_start = ss_clip + padding_s
+            skip_end = se_clip - padding_s
+            if skip_end > skip_start:
+                skips.append((skip_start, skip_end))
+        if not skips:
+            new_keeps.append((ks, ke))
+            continue
+        # Invert skips within [ks, ke] -> sub-keeps.
+        skips.sort()
+        cursor = ks
+        for cs, ce in skips:
+            if cs > cursor:
+                new_keeps.append((cursor, cs))
+            cursor = max(cursor, ce)
+        if cursor < ke:
+            new_keeps.append((cursor, ke))
+    return new_keeps
+
+
 def cuts_to_keeps(cuts: List[Tuple[float, float]], duration: float) -> List[Tuple[float, float]]:
     """Invert cut ranges into keep ranges over [0, duration]."""
     keeps: List[Tuple[float, float]] = []
