@@ -18,6 +18,8 @@ import subprocess
 import threading
 from typing import List, Tuple
 
+import numpy as np
+import soundfile as sf
 from tqdm import tqdm
 
 from . import progress
@@ -99,29 +101,72 @@ def _cut_streamcopy(
     print(f"[cutter] stream-copy: wrote {output_path} ({len(seg_paths)} segments, {total_keep:.1f}s kept)")
 
 
-def _build_filter_script(keep_ranges: List[Tuple[float, float]]) -> str:
-    """Build a filter_complex script: select for video (single filter, fast),
-    trim+concat for audio (proven correct, slightly slower but unavoidable).
-
-    Why hybrid: a single `select` filter compresses N video ranges in O(1)
-    filters, but the equivalent `aselect` on audio mishandles variable-size
-    audio frames — `asetpts=N/SR/TB` underflows because N is FRAME index not
-    sample index, leaving audio at original PTS and the container duration
-    blown out to the source length. Audio trim+concat is reliable.
-
-    Written to disk and passed via -filter_complex_script (avoids Windows 8KB
-    command-line limit on 200+ range expressions)."""
-    # Video: single select filter with between() expression OR'd via +.
+def _build_video_filter_script(keep_ranges: List[Tuple[float, float]]) -> str:
+    """Video-only filter: single select with between() expression OR'd via +.
+    Audio is pre-spliced in Python (see _splice_audio) and muxed as a second
+    input — way faster than 600+ atrim+concat filters on the audio side which
+    bottleneck ffmpeg's filter scheduler and freeze the pipeline."""
     video_expr = "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in keep_ranges)
-    video_chain = f"[0:v]select='{video_expr}',setpts=N/FRAME_RATE/TB[outv]"
-    # Audio: trim each range then concat them in order.
-    audio_parts = []
-    audio_labels = []
-    for i, (s, e) in enumerate(keep_ranges):
-        audio_parts.append(f"[0:a]atrim={s:.3f}:{e:.3f},asetpts=PTS-STARTPTS[a{i}]")
-        audio_labels.append(f"[a{i}]")
-    audio_concat = f"{''.join(audio_labels)}concat=n={len(keep_ranges)}:v=0:a=1[outa]"
-    return ";\n".join([video_chain] + audio_parts + [audio_concat])
+    return f"[0:v]select='{video_expr}',setpts=N/FRAME_RATE/TB[outv]"
+
+
+def _splice_audio(
+    source_path: str,
+    keep_ranges: List[Tuple[float, float]],
+    work_dir: str,
+) -> str:
+    """Pre-splice the source audio into a single wav containing only the
+    keep_ranges, concatenated in order. Returns the path to the spliced wav.
+
+    Strategy:
+      1. Decode source audio to a temp wav once (ffmpeg, one pass).
+      2. Read each keep_range as a slice from that wav (soundfile seeks via
+         start/stop sample indices — no full-file load).
+      3. Write the slices in order to the output wav (incremental write,
+         constant memory).
+
+    This avoids ffmpeg's filter graph entirely for audio. On a 600+ segment
+    run, the 600+ atrim+concat filter chain becomes the bottleneck (single-
+    threaded filter scheduling, frame-by-frame buffer shuffling). This
+    approach does the equivalent work in raw numpy seek/copy operations —
+    typically 10-50x faster.
+    """
+    sr = 48000
+    channels = 2
+    full_wav = os.path.join(work_dir, "audio_full.wav")
+    out_wav = os.path.join(work_dir, "audio_spliced.wav")
+
+    # 1. Decode source to a clean wav we can random-access.
+    if not os.path.exists(full_wav) or os.path.getsize(full_wav) == 0:
+        print(f"[cutter] extracting source audio -> wav...")
+        cmd = [
+            "ffmpeg", "-y", "-i", source_path,
+            "-vn",
+            "-c:a", "pcm_s16le",
+            "-ar", str(sr),
+            "-ac", str(channels),
+            full_wav,
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # 2. Splice in Python via soundfile's seek-based reads.
+    info = sf.info(full_wav)
+    real_sr = info.samplerate
+    real_ch = info.channels
+    total_samples = sum(int(round((e - s) * real_sr)) for s, e in keep_ranges)
+    print(f"[cutter] splicing {len(keep_ranges)} audio segments "
+          f"({total_samples/real_sr:.1f}s output) in Python...")
+    with sf.SoundFile(out_wav, mode="w", samplerate=real_sr,
+                      channels=real_ch, subtype="PCM_16") as f_out:
+        for s, e in keep_ranges:
+            start_sample = max(0, int(round(s * real_sr)))
+            end_sample = max(start_sample, int(round(e * real_sr)))
+            if end_sample <= start_sample:
+                continue
+            chunk, _ = sf.read(full_wav, start=start_sample, stop=end_sample,
+                               dtype="int16", always_2d=True)
+            f_out.write(chunk)
+    return out_wav
 
 
 def _pick_video_encoder() -> tuple[list[str], str]:
@@ -187,20 +232,36 @@ def _cut_reencode(
     output_path: str,
     work_dir: str,
 ) -> None:
-    """Single-pass re-encode with filter_complex. Required when there are many
-    segments or short segments — stream-copy drifts multi-minutes across many
-    keyframe-rounded cuts."""
-    filter_script = _build_filter_script(keep_ranges)
+    """Single-pass re-encode. VIDEO via select filter (one filter, fast).
+    AUDIO is pre-spliced in Python and muxed as a second input — the
+    previous approach with 600+ atrim+concat filters made ffmpeg's filter
+    scheduler the bottleneck and gave 4hr ETAs on a 3hr vod.
+
+    Stream-copy isn't usable here because keyframe-snap drift compounds
+    across hundreds of micro-cuts."""
+    # 1. Pre-splice audio in Python.
+    spliced_audio = _splice_audio(source_path, keep_ranges, work_dir)
+
+    # 2. Build the (now small) video-only filter script.
+    filter_script = _build_video_filter_script(keep_ranges)
     script_path = os.path.join(work_dir, "filter_complex.txt")
     with open(script_path, "w", encoding="utf-8") as f:
         f.write(filter_script)
 
     enc_args, enc_name = _pick_video_encoder()
+    # Benchmarked alternatives (cutter_bench.py): SELECT filter without
+    # hwaccel is fastest at ~4x realtime. `-hwaccel cuda` actually breaks
+    # this filter+dual-input setup (errors out). `-filter_threads 4` lets
+    # the select filter parallelize across CPU cores. Per-range ffmpeg
+    # invocations and concat-inpoint demuxer are 2-40x slower due to
+    # per-range setup overhead.
     cmd = [
         "ffmpeg", "-y",
         "-i", source_path,
+        "-i", spliced_audio,
         "-filter_complex_script", script_path,
-        "-map", "[outv]", "-map", "[outa]",
+        "-filter_threads", "4",
+        "-map", "[outv]", "-map", "1:a",
         *enc_args,
         "-c:a", "aac", "-b:a", "192k",
         output_path,
@@ -209,15 +270,17 @@ def _cut_reencode(
     print(f"[cutter] re-encoding {len(keep_ranges)} segments ({total_keep:.1f}s) via {enc_name}...")
     rc, stderr_tail = _run_ffmpeg_with_progress(cmd, total_keep, f"[cutter] {enc_name}")
     if rc != 0:
-        # Fallback to libx264 if nvenc choked (driver mismatch etc).
+        # Fallback to libx264 if nvenc choked.
         if enc_name == "h264_nvenc":
             print(f"[cutter] {enc_name} failed, falling back to libx264")
             print(stderr_tail[-500:])
             cmd_fallback = [
                 "ffmpeg", "-y",
                 "-i", source_path,
+                "-i", spliced_audio,
                 "-filter_complex_script", script_path,
-                "-map", "[outv]", "-map", "[outa]",
+                "-filter_threads", "4",
+                "-map", "[outv]", "-map", "1:a",
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                 "-c:a", "aac", "-b:a", "192k",
                 output_path,
