@@ -12,9 +12,13 @@ Auto-selects based on segment count + minimum segment length. Prefers h264_nvenc
 when the encoder is available (much faster on NVIDIA GPUs).
 """
 import os
+import re
 import shutil
 import subprocess
+import threading
 from typing import List, Tuple
+
+from tqdm import tqdm
 
 
 # Re-encode triggers: many segments OR short segments mean stream-copy drift
@@ -94,31 +98,84 @@ def _cut_streamcopy(
 
 
 def _build_filter_script(keep_ranges: List[Tuple[float, float]]) -> str:
-    """Build a filter_complex script: trim each range, then concat them all.
-    Returned as a single string ready to be written to disk and passed via
-    -filter_complex_script (avoids Windows 8KB command-line limit)."""
-    parts = []
-    labels = []
+    """Build a filter_complex script: select for video (single filter, fast),
+    trim+concat for audio (proven correct, slightly slower but unavoidable).
+
+    Why hybrid: a single `select` filter compresses N video ranges in O(1)
+    filters, but the equivalent `aselect` on audio mishandles variable-size
+    audio frames — `asetpts=N/SR/TB` underflows because N is FRAME index not
+    sample index, leaving audio at original PTS and the container duration
+    blown out to the source length. Audio trim+concat is reliable.
+
+    Written to disk and passed via -filter_complex_script (avoids Windows 8KB
+    command-line limit on 200+ range expressions)."""
+    # Video: single select filter with between() expression OR'd via +.
+    video_expr = "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in keep_ranges)
+    video_chain = f"[0:v]select='{video_expr}',setpts=N/FRAME_RATE/TB[outv]"
+    # Audio: trim each range then concat them in order.
+    audio_parts = []
+    audio_labels = []
     for i, (s, e) in enumerate(keep_ranges):
-        parts.append(f"[0:v]trim={s:.3f}:{e:.3f},setpts=PTS-STARTPTS[v{i}]")
-        parts.append(f"[0:a]atrim={s:.3f}:{e:.3f},asetpts=PTS-STARTPTS[a{i}]")
-        labels.append(f"[v{i}][a{i}]")
-    concat = f"{''.join(labels)}concat=n={len(keep_ranges)}:v=1:a=1[outv][outa]"
-    return ";\n".join(parts + [concat])
+        audio_parts.append(f"[0:a]atrim={s:.3f}:{e:.3f},asetpts=PTS-STARTPTS[a{i}]")
+        audio_labels.append(f"[a{i}]")
+    audio_concat = f"{''.join(audio_labels)}concat=n={len(keep_ranges)}:v=0:a=1[outa]"
+    return ";\n".join([video_chain] + audio_parts + [audio_concat])
 
 
 def _pick_video_encoder() -> tuple[list[str], str]:
-    """Prefer h264_nvenc (NVIDIA) for speed, fallback to libx264."""
+    """Prefer h264_nvenc preset p1 (fastest NVENC mode), fallback to libx264.
+    p1 is meaningfully faster than p4 on this GPU for marginal quality loss —
+    the source is already lossy YouTube re-encode so the difference is
+    invisible."""
     enc_list = subprocess.run(
         ["ffmpeg", "-hide_banner", "-encoders"],
         capture_output=True, text=True,
     ).stdout
     if "h264_nvenc" in enc_list:
         return (
-            ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0"],
+            ["-c:v", "h264_nvenc", "-preset", "p1", "-rc", "vbr", "-cq", "23", "-b:v", "0"],
             "h264_nvenc",
         )
     return (["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"], "libx264")
+
+
+def _run_ffmpeg_with_progress(cmd: list, total_keep_s: float, label: str) -> tuple[int, str]:
+    """Run ffmpeg with -progress pipe:1 and drive a tqdm bar from out_time_us.
+    Returns (returncode, last_2KB_of_stderr) for error reporting."""
+    full_cmd = list(cmd) + ["-progress", "pipe:1", "-nostats", "-loglevel", "error"]
+    proc = subprocess.Popen(
+        full_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        bufsize=1, universal_newlines=True,
+    )
+    stderr_buf = []
+    pbar = tqdm(
+        total=int(total_keep_s), unit="s", desc=label,
+        bar_format="{l_bar}{bar}| {n}/{total}s [{elapsed}<{remaining}]",
+        leave=True,
+    )
+    # Stderr drain thread so it doesn't deadlock if ffmpeg's stderr buffer fills.
+    def _drain():
+        for line in proc.stderr:
+            stderr_buf.append(line)
+            if sum(len(s) for s in stderr_buf) > 4000:
+                stderr_buf.pop(0)
+    drain = threading.Thread(target=_drain, daemon=True)
+    drain.start()
+    out_time_re = re.compile(r"^out_time_us=(\d+)")
+    last = 0
+    for line in proc.stdout:
+        m = out_time_re.match(line.strip())
+        if m:
+            cur_s = min(int(m.group(1)) // 1_000_000, int(total_keep_s))
+            if cur_s > last:
+                pbar.update(cur_s - last)
+                last = cur_s
+    pbar.n = pbar.total
+    pbar.refresh()
+    pbar.close()
+    proc.wait()
+    drain.join(timeout=2)
+    return proc.returncode, "".join(stderr_buf)
 
 
 def _cut_reencode(
@@ -147,13 +204,13 @@ def _cut_reencode(
     ]
     total_keep = sum(e - s for s, e in keep_ranges)
     print(f"[cutter] re-encoding {len(keep_ranges)} segments ({total_keep:.1f}s) via {enc_name}...")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
+    rc, stderr_tail = _run_ffmpeg_with_progress(cmd, total_keep, f"[cutter] {enc_name}")
+    if rc != 0:
         # Fallback to libx264 if nvenc choked (driver mismatch etc).
         if enc_name == "h264_nvenc":
             print(f"[cutter] {enc_name} failed, falling back to libx264")
-            print(result.stderr[-500:])
-            cmd = [
+            print(stderr_tail[-500:])
+            cmd_fallback = [
                 "ffmpeg", "-y",
                 "-i", source_path,
                 "-filter_complex_script", script_path,
@@ -162,9 +219,9 @@ def _cut_reencode(
                 "-c:a", "aac", "-b:a", "192k",
                 output_path,
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg re-encode failed:\n{result.stderr[-1500:]}")
+            rc, stderr_tail = _run_ffmpeg_with_progress(cmd_fallback, total_keep, "[cutter] libx264")
+        if rc != 0:
+            raise RuntimeError(f"ffmpeg re-encode failed:\n{stderr_tail[-1500:]}")
     if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
         raise RuntimeError(f"ffmpeg re-encode produced no output at {output_path}")
     print(f"[cutter] wrote {output_path}")

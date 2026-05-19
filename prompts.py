@@ -55,8 +55,12 @@ format consistently across ALL ranges. NEVER mix formats within a single range \
 right would parse as 2.5 hours). Always use leading zeros (`00:00:45`, not `45`).
 2. Cuts must be SPECIFIC — target boring sections you actually identified. Do \
 NOT chunk the runtime into equal blocks. Do NOT cut a single giant range. \
-Typical good output has 5-30 cut ranges of varying lengths (10 seconds to a \
-few minutes).
+Cut ranges should be varying lengths (10 seconds to a few minutes). The user \
+prompt below specifies how many cuts are appropriate for THIS video's length \
+— hitting a too-low count for a long video means you missed boring sections.
+2b. Cuts do NOT have to be in chronological order. If you finish a first pass \
+and realize you missed some boring stretches, just append more ranges. Order \
+doesn't matter — the parser sorts them.
 3. NEVER list a range you want to keep. Only put ranges to REMOVE inside \
 CUTS_BEGIN/CUTS_END.
 4. NEVER cut a HIGHLIGHT you listed above — that's a contradiction.
@@ -78,6 +82,12 @@ Target cut: roughly 30-60% of runtime (i.e. keep {min_keep_str}-{max_keep_str}).
 If the video is mostly gold, cut less. If most is filler, cut more — but you \
 MUST keep at least {min_keep_str} of runtime ({min_keep_sec:.0f} seconds). A \
 response that cuts more than 65% will be rejected.
+
+EXPECTED CUT COUNT for a video this length: aim for {cut_target_low}-{cut_target_high} \
+distinct cut ranges. Fewer than {cut_target_low_strict} means you're being lazy — \
+a long video has many more boring stretches than a short one, and emitting only a \
+handful of giant cuts wastes the granularity. If you're tempted to stop early, \
+keep going and find more boring sections to remove.
 
 Transcript follows. Each line: [start-end] P=<peak_dB> M=<mean_dB> L=<loud_frac> | text
 
@@ -106,12 +116,22 @@ def build_user_prompt(duration: float, segments: list, loudness_per_seg: list) -
     # the v0 prompt got a 90%-cut response.
     min_keep_sec = duration * 0.35
     max_keep_sec = duration * 0.70
+    # Cut count target: scale with duration so the model doesn't emit ~20 cuts
+    # on a 3hr video the same way it did on a 45min one. Baseline observed:
+    # ~0.5 cuts/min on early test runs. We push for higher to combat laziness.
+    duration_min = duration / 60.0
+    cut_target_low = max(8, int(round(duration_min * 0.6)))
+    cut_target_high = max(15, int(round(duration_min * 1.2)))
+    cut_target_low_strict = max(5, int(round(duration_min * 0.4)))
     header = USER_PROMPT_HEADER.format(
         duration_str=_hms(duration),
         duration_sec=duration,
         min_keep_str=_hms(min_keep_sec),
         max_keep_str=_hms(max_keep_sec),
         min_keep_sec=min_keep_sec,
+        cut_target_low=cut_target_low,
+        cut_target_high=cut_target_high,
+        cut_target_low_strict=cut_target_low_strict,
     )
     lines = [header]
     for seg, loud in zip(segments, loudness_per_seg):

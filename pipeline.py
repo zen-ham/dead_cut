@@ -1,8 +1,18 @@
 """End-to-end orchestrator."""
 import os
+import subprocess
 import time
 
 from .cache import cache_dir, video_id_from_url, save_json
+
+
+def _ffprobe_duration(path: str) -> float:
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True,
+    )
+    return float(r.stdout.strip())
 from .download import download
 from .transcribe import transcribe
 from .loudness import analyze as analyze_loudness
@@ -36,6 +46,20 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
 
     # 1. Download
     video_path = download(url, vid)
+
+    # Source duration is known after download; print a rough ETA banner.
+    # Ratios measured on this machine (GTX 1660 Ti, batched int8_float16):
+    #   transcribe ~0.07x of source duration  (small model batched)
+    #   loudness   ~0.02x of source duration
+    #   llm        ~30s (fixed, free model)
+    #   reencode   ~0.6x of EXPECTED OUTPUT duration (which is ~0.3-0.5x source)
+    # Total ≈ ~0.3x of source duration.
+    try:
+        src_dur = _ffprobe_duration(video_path)
+        est_total_min = src_dur * 0.30 / 60.0
+        print(f"[pipeline] source ~{src_dur/60.0:.1f} min — rough ETA ~{est_total_min:.0f} min on this machine\n")
+    except Exception:
+        pass
 
     # 2. Transcribe
     transcript = transcribe(video_path, vid)

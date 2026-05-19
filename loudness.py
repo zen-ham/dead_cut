@@ -53,9 +53,6 @@ def analyze(video_path: str, video_id: str, segments: list) -> dict:
     track_mean = float(np.mean(db))
     track_p90 = float(np.percentile(db, 90))
     loud_threshold = track_mean + 6.0  # 6 dB above mean = "loud" in this track
-    # Silence threshold: well below mean but with an absolute floor so
-    # quieter-overall tracks don't get the entire track flagged as silence.
-    silence_threshold = max(track_mean - 12.0, -45.0)
 
     win_secs = WINDOW_MS / 1000.0
     per_segment = []
@@ -72,6 +69,19 @@ def analyze(video_path: str, video_id: str, segments: list) -> dict:
             "loud_frac": round(float(np.mean(chunk > loud_threshold)), 3),
         })
 
+    # Speech-level silence threshold: previously we used (track_mean - 12) but
+    # that's biased by silence ratio (long-dead-air vods get a low mean that
+    # pulls the threshold too low, and game-music vods get a high mean from
+    # the music). Instead use the median of segment mean_db — segments are
+    # VAD-filtered speech regions, so their median is a clean speech-volume
+    # estimate that adapts per-video and handles background music correctly.
+    if per_segment:
+        speech_means = sorted(s["mean_db"] for s in per_segment if s["mean_db"] > -85)
+        speech_level = speech_means[len(speech_means) // 2] if speech_means else track_mean
+    else:
+        speech_level = track_mean
+    silence_threshold = max(speech_level - 12.0, -50.0)
+
     # Detect silence runs for cut-boundary snapping. A run of ≥MIN_SILENCE_MS
     # of windows below silence_threshold counts as a silence interval.
     silences = _detect_silences(db, win_secs, silence_threshold, MIN_SILENCE_MS)
@@ -79,6 +89,7 @@ def analyze(video_path: str, video_id: str, segments: list) -> dict:
     result = {
         "track_mean_db": round(track_mean, 1),
         "track_p90_db": round(track_p90, 1),
+        "speech_level_db": round(speech_level, 1),
         "loud_threshold_db": round(loud_threshold, 1),
         "silence_threshold_db": round(silence_threshold, 1),
         "window_ms": WINDOW_MS,
@@ -87,8 +98,9 @@ def analyze(video_path: str, video_id: str, segments: list) -> dict:
         "silences": silences,
     }
     save_json(out_path, result)
-    print(f"[loudness] mean={track_mean:.1f}dB p90={track_p90:.1f}dB loud_thr={loud_threshold:.1f}dB "
-          f"silence_thr={silence_threshold:.1f}dB silences={len(silences)}")
+    print(f"[loudness] mean={track_mean:.1f}dB p90={track_p90:.1f}dB "
+          f"speech_level={speech_level:.1f}dB silence_thr={silence_threshold:.1f}dB "
+          f"silences={len(silences)}")
     return result
 
 
