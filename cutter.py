@@ -20,6 +20,8 @@ from typing import List, Tuple
 
 from tqdm import tqdm
 
+from . import progress
+
 
 # Re-encode triggers: many segments OR short segments mean stream-copy drift
 # will be visible. Past these thresholds, switch to filter_complex re-encode.
@@ -149,9 +151,9 @@ def _run_ffmpeg_with_progress(cmd: list, total_keep_s: float, label: str) -> tup
     )
     stderr_buf = []
     pbar = tqdm(
-        total=int(total_keep_s), unit="s", desc=label,
-        bar_format="{l_bar}{bar}| {n}/{total}s [{elapsed}<{remaining}]",
-        leave=True,
+        total=int(total_keep_s), unit="s", desc=f"[stage   ] {label}",
+        bar_format="{desc} {bar} {percentage:3.0f}% | {n}/{total}s | eta {remaining}",
+        position=1, leave=False,
     )
     # Stderr drain thread so it doesn't deadlock if ffmpeg's stderr buffer fills.
     def _drain():
@@ -170,6 +172,7 @@ def _run_ffmpeg_with_progress(cmd: list, total_keep_s: float, label: str) -> tup
             if cur_s > last:
                 pbar.update(cur_s - last)
                 last = cur_s
+                progress.tick()
     pbar.n = pbar.total
     pbar.refresh()
     pbar.close()

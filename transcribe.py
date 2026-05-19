@@ -11,6 +11,7 @@ from faster_whisper import WhisperModel, BatchedInferencePipeline
 from tqdm import tqdm
 
 from .cache import cache_dir, save_json, load_json
+from . import progress
 
 
 DEFAULT_MODEL = "small"
@@ -62,9 +63,9 @@ def transcribe(
     # tqdm: drive progress by audio-time-covered vs total duration, since we
     # know info.duration up front and segments come in chronological order.
     pbar = tqdm(
-        total=float(info.duration), unit="s", desc="[transcribe]",
-        bar_format="{l_bar}{bar}| {n:.0f}/{total:.0f}s [{elapsed}<{remaining}]",
-        leave=True,
+        total=float(info.duration), unit="s", desc="[stage   ] transcribe",
+        bar_format="{desc} {bar} {percentage:3.0f}% | {n:.0f}/{total:.0f}s | eta {remaining}",
+        position=1, leave=False,
     )
     prev_end = 0.0
     for s in segments_iter:
@@ -76,6 +77,7 @@ def transcribe(
         delta = max(0.0, s.end - prev_end)
         pbar.update(delta)
         prev_end = s.end
+        progress.tick()
     # Snap to 100% in case the last segment ended slightly short of info.duration.
     pbar.n = pbar.total
     pbar.refresh()
