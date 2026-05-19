@@ -83,17 +83,21 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
     print(f"\n=== dead_cut: {url}  (id={vid}, iter={iteration}) ===\n")
     out_dir = cache_dir(vid)
 
+    # Init progress tracker BEFORE download so the overall bar covers the
+    # download stage too. We don't know source duration yet — the tracker
+    # uses a placeholder estimate (DEFAULT_SOURCE_S) and refines once
+    # download finishes and we can ffprobe the source.
+    progress.init()
+
     # 1. Download
     progress.begin_stage("download")
     video_path = download(url, vid)
     progress.end_stage("download")
 
-    # Source duration is known after download — initialise the pipeline-wide
-    # progress tracker so all subsequent stages drive both their own bar and
-    # the overall bar.
+    # Now refine the overall estimate with the actual source duration.
     try:
         src_dur = _ffprobe_duration(video_path)
-        progress.init(src_dur)
+        progress.set_source_duration(src_dur)
         print(f"[pipeline] source ~{src_dur/60.0:.1f} min\n")
     except Exception:
         pass

@@ -11,7 +11,11 @@ its baseline in the total, so the ETA refines.
 The overall bar's "current" is wall-clock elapsed time since pipeline start —
 no fancy weighted-progress math. This is the most honest representation: "this
 is how long it's actually taken, here's how long I think it'll take total."
+
+A background ticker thread refreshes the bar every 2s so even stages without
+their own progress callbacks (like the yt-dlp download) animate the bar live.
 """
+import threading
 import time
 from tqdm import tqdm
 
@@ -34,8 +38,13 @@ _TRACKER = None  # module-level singleton; pipeline initialises, stages call.
 
 
 class PipelineTracker:
-    def __init__(self, source_duration_s: float):
-        self.source = source_duration_s
+    # If pipeline initialises before source duration is known (e.g. before
+    # download), assume a typical-length vod for the initial estimate. Gets
+    # refined by set_source_duration() once download finishes.
+    DEFAULT_SOURCE_S = 1800.0  # 30min — close enough for the bar to be useful
+
+    def __init__(self, source_duration_s: float | None = None):
+        self.source = source_duration_s if source_duration_s else self.DEFAULT_SOURCE_S
         self.start_time = time.time()
         self.actual_elapsed: dict[str, float] = {}
         self._stage_starts: dict[str, float] = {}
@@ -45,6 +54,30 @@ class PipelineTracker:
             bar_format="{desc} {bar} {percentage:3.0f}% | {n_fmt}/{total_fmt}s | elapsed {elapsed} | eta {remaining}",
             leave=True,
         )
+        # Background ticker — keeps the bar live during stages that don't
+        # call progress.tick() (e.g. the yt-dlp download).
+        self._stop_event = threading.Event()
+        self._ticker = threading.Thread(target=self._tick_loop, daemon=True)
+        self._ticker.start()
+
+    def _tick_loop(self) -> None:
+        while not self._stop_event.wait(2.0):
+            try:
+                self.tick()
+            except Exception:
+                # If the bar is closed mid-tick, just stop.
+                break
+
+    def set_source_duration(self, s: float) -> None:
+        """Pipeline calls this once it knows the actual source duration (after
+        download). Refreshes the overall ETA — for very long sources the bar
+        was probably under-estimated; for short sources, over-estimated."""
+        if s and s > 0:
+            self.source = s
+            new_total = int(self._total_estimate())
+            if new_total != self.overall.total:
+                self.overall.total = new_total
+            self.tick()
 
     def _estimate(self, stage: str) -> float:
         mode, val = _BASELINES[stage]
@@ -88,6 +121,8 @@ class PipelineTracker:
         self.overall.refresh()
 
     def close(self) -> None:
+        self._stop_event.set()
+        self._ticker.join(timeout=3.0)
         self.overall.n = self.overall.total
         self.overall.refresh()
         self.overall.close()
@@ -95,10 +130,15 @@ class PipelineTracker:
 
 # Module-level convenience API. Pipeline initialises, stages call.
 
-def init(source_duration_s: float) -> PipelineTracker:
+def init(source_duration_s: float | None = None) -> PipelineTracker:
     global _TRACKER
     _TRACKER = PipelineTracker(source_duration_s)
     return _TRACKER
+
+
+def set_source_duration(s: float) -> None:
+    if _TRACKER is not None:
+        _TRACKER.set_source_duration(s)
 
 
 def begin_stage(name: str) -> None:
