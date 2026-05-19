@@ -4,14 +4,17 @@ Design notes:
 - The transcript is rendered as one line per segment, prefixed by [start-end]
   in HH:MM:SS so the model never has to do arithmetic.
 - Loudness is summarised compactly per segment: P=peak_db M=mean_db L=loud_frac.
-- The model is required to emit a HIGHLIGHTS block FIRST, then a brief REASONING
-  block, then the CUTS block. The HIGHLIGHTS block forces actual engagement with
-  content — without it, lazy models just block-chunk the entire runtime.
-- The parser only reads cut ranges from inside CUTS_BEGIN / CUTS_END, so any
-  timestamps mentioned in the reasoning or highlights blocks are ignored. The
-  model can freely say "keep 9:13-10:40" in prose without it being cut.
-- A duration-aware minimum-keep is injected into the prompt to prevent the model
-  from cutting 90% of the runtime in one lazy block.
+- The model emits FOUR blocks: HIGHLIGHTS (engagement proof), CANDIDATES
+  (first-pass candidates), AUDIT (forced arithmetic — sum the draft, compute
+  cut percentage, decide if over budget and which drafts to drop), then the
+  FINAL CUTS block which is the only one the parser reads. This scratchpad
+  structure forces non-thinking models to do reasoning IN their output —
+  by the time they emit final CUTS, they've already written the audit math
+  in their own context and committed to dropping over-budget candidates.
+  Caught the failure mode where a 3hr vod got 94% cut because the model
+  enumerated boring stretches without summing them.
+- The parser only reads CUTS_BEGIN..CUTS_END, so CANDIDATES / AUDIT timestamps
+  are ignored.
 """
 
 SYSTEM_PROMPT = """You are an expert video editor working on a streamer/vod \
@@ -25,7 +28,7 @@ tutorial text being read out loud, slow navigation/walking, dead air, repeated \
 "alrights" while figuring out what to do next, technical setup, and intro/outro \
 filler.
 
-YOUR OUTPUT MUST HAVE THREE BLOCKS IN THIS ORDER:
+YOUR OUTPUT MUST HAVE FOUR BLOCKS IN THIS EXACT ORDER:
 
   HIGHLIGHTS_BEGIN
   HH:MM:SS — brief note on the funny/interesting/memorable moment here
@@ -33,20 +36,39 @@ YOUR OUTPUT MUST HAVE THREE BLOCKS IN THIS ORDER:
   (list at least 6 specific highlights; be concrete about WHAT is funny)
   HIGHLIGHTS_END
 
-  REASONING_BEGIN
-  A short paragraph (3-6 sentences) explaining the cut strategy: what kinds of \
-sections are boring in THIS specific video, which big chunks you're removing, \
-and why you're keeping the parts you're keeping.
-  REASONING_END
+  CANDIDATES_BEGIN
+  HH:MM:SS-HH:MM:SS
+  HH:MM:SS-HH:MM:SS
+  (your first-pass candidate cut ranges; one per line)
+  CANDIDATES_END
+
+  AUDIT_BEGIN
+  Now sum your draft cuts and check the budget. Show the math:
+
+  draft_total: <sum of all your CANDIDATES durations, in HH:MM:SS>
+  duration:    <total video duration from the user prompt>
+  cut_percent: <draft_total / duration as percent, e.g. 47%>
+  verdict:     <WITHIN BUDGET if cut_percent < 65%, else OVER BUDGET>
+
+  If OVER BUDGET, you MUST drop draft cuts to get under 65%. List which ones \
+you're dropping with a short reason for each (e.g. "00:14:00-00:16:00 — only \
+guessed it was boring, no strong signal"). Pick the cuts you're LEAST \
+confident were genuinely boring. Then re-sum and re-verify until under 65%.
+
+  IMPORTANT: Do NOT write the literal strings "CUTS_BEGIN" or "CUTS_END" \
+anywhere in this AUDIT block — those are reserved for the final block below.
+  AUDIT_END
 
   CUTS_BEGIN
+  <your CANDIDATES list, minus anything the audit told you to drop>
   HH:MM:SS-HH:MM:SS
   HH:MM:SS-HH:MM:SS
   CUTS_END
 
-The HIGHLIGHTS block is mandatory — it proves you actually read the transcript. \
-A response that skips straight to CUTS_BEGIN will be rejected. The HIGHLIGHTS \
-should be specific (quote the line or describe the action), not generic.
+The parser only applies the CUTS_BEGIN..CUTS_END block. The other three blocks \
+are your scratchpad — but they ARE mandatory. A response that skips CANDIDATES \
+or AUDIT, or where the AUDIT math doesn't add up, indicates a lazy / sloppy \
+edit and will be rejected.
 
 HARD RULES FOR CUTS:
 1. Each cut range is HH:MM:SS-HH:MM:SS (or MM:SS-MM:SS), one per line. Use ONE \
@@ -59,14 +81,14 @@ Cut ranges should be varying lengths (10 seconds to a few minutes). The user \
 prompt below specifies how many cuts are appropriate for THIS video's length \
 — hitting a too-low count for a long video means you missed boring sections.
 2b. Cuts do NOT have to be in chronological order. If you finish a first pass \
-and realize you missed some boring stretches, just append more ranges. Order \
-doesn't matter — the parser sorts them.
-3. NEVER list a range you want to keep. Only put ranges to REMOVE inside \
-CUTS_BEGIN/CUTS_END.
+and realize you missed some boring stretches, just append more ranges to \
+CANDIDATES. Order doesn't matter — the parser sorts them.
+3. NEVER list a range you want to keep. Only put ranges to REMOVE inside the \
+CUTS_BEGIN/CUTS_END block.
 4. NEVER cut a HIGHLIGHT you listed above — that's a contradiction.
-5. Don't over-fragment. Keep the cut count reasonable. Each individual cut \
-should be at least ~15 seconds long; sub-10s micro-cuts make the result feel \
-twitchy without saving meaningful time.
+5. Don't over-fragment. Each individual cut should be at least ~15 seconds \
+long; sub-10s micro-cuts make the result feel twitchy without saving \
+meaningful time.
 6. The CUTS_END line must be the last thing in your response.
 
 LOUDNESS HINT: each transcript line includes P (peak dB), M (mean dB), L (loud \
@@ -81,13 +103,13 @@ USER_PROMPT_HEADER = """Video duration: {duration_str} ({duration_sec:.0f} secon
 Target cut: roughly 30-60% of runtime (i.e. keep {min_keep_str}-{max_keep_str}). \
 If the video is mostly gold, cut less. If most is filler, cut more — but you \
 MUST keep at least {min_keep_str} of runtime ({min_keep_sec:.0f} seconds). A \
-response that cuts more than 65% will be rejected.
+response that cuts more than 65% will be rejected — that's why the AUDIT step \
+exists, to catch yourself before you submit an over-aggressive list.
 
 EXPECTED CUT COUNT for a video this length: aim for {cut_target_low}-{cut_target_high} \
 distinct cut ranges. Fewer than {cut_target_low_strict} means you're being lazy — \
 a long video has many more boring stretches than a short one, and emitting only a \
-handful of giant cuts wastes the granularity. If you're tempted to stop early, \
-keep going and find more boring sections to remove.
+handful of giant cuts wastes the granularity.
 
 Transcript follows. Each line: [start-end] P=<peak_dB> M=<mean_dB> L=<loud_frac> | text
 

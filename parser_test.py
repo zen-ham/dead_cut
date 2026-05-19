@@ -1,6 +1,6 @@
 """Test the parser handles the LLM output formats we expect, plus the
 adversarial cases the user warned about."""
-from .parser import parse_cuts, cuts_to_keeps, snap_cuts_to_silence, trim_silences_within_keeps
+from .parser import parse_cuts, cuts_to_keeps, snap_cuts_to_silence, trim_silences_within_keeps, enforce_budget
 
 
 def _expect(actual, expected, label):
@@ -67,6 +67,21 @@ def run():
     CUTS_END
     """)
     _expect(r, [(0.0, 10.0)], "last block wins")
+
+    # 7b. A keyword prefixed like DRAFT_CUTS_BEGIN must NOT match CUTS_BEGIN —
+    #     the leading word-boundary in the parser regex prevents it. This
+    #     matters for the scratchpad prompt structure where CANDIDATES_BEGIN
+    #     replaces the unsafe DRAFT_CUTS_BEGIN, but defense-in-depth.
+    r = parse_cuts("""
+    DRAFT_CUTS_BEGIN
+    0:00-0:99
+    DRAFT_CUTS_END
+
+    CUTS_BEGIN
+    0:00-0:10
+    CUTS_END
+    """)
+    _expect(r, [(0.0, 10.0)], "DRAFT_CUTS_BEGIN does not match CUTS_BEGIN")
 
     # 8. Invalid range (end <= start) is dropped silently.
     r = parse_cuts("CUTS_BEGIN\n2:00-1:00\n3:00-4:00\nCUTS_END")
@@ -177,6 +192,23 @@ def run():
     # 20. No silences = no-op.
     r = trim_silences_within_keeps([(0.0, 100.0)], [], max_silence_s=0.6, padding_s=0.2)
     _expect(r, [(0.0, 100.0)], "no silences = no-op")
+
+    # 21. enforce_budget: under budget = unchanged.
+    cuts = [(0, 30), (40, 50)]   # 40s of 100 = 40% < 65%
+    r, trimmed = enforce_budget(cuts, duration=100.0, ceiling_frac=0.65)
+    _expect((r, trimmed), (cuts, False), "enforce_budget under budget no-op")
+
+    # 22. enforce_budget: drops longest until under ceiling.
+    cuts = [(0, 50), (60, 90), (95, 100)]    # 85s = 85% (over)
+    # Drop longest first (50s cut) -> remaining 35s = 35% (under 65%)
+    r, trimmed = enforce_budget(cuts, duration=100.0, ceiling_frac=0.65)
+    _expect((r, trimmed), ([(60, 90), (95, 100)], True), "enforce_budget drops longest")
+
+    # 23. enforce_budget: preserves original order of kept cuts.
+    cuts = [(0, 10), (20, 90), (95, 100)]    # 75s = 75% over; longest is (20,90)=70s
+    # Drop (20,90), remaining: (0,10) and (95,100) = 15s = 15% under
+    r, trimmed = enforce_budget(cuts, duration=100.0, ceiling_frac=0.65)
+    _expect((r, trimmed), ([(0, 10), (95, 100)], True), "enforce_budget preserves order")
 
     print("[parser_test] ALL PASS")
 

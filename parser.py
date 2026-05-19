@@ -24,10 +24,14 @@ def _ts_to_sec(h: str, m: str, s: str | None) -> float:
 
 
 def _extract_cut_block(text: str) -> str | None:
-    """Return the content of the LAST CUTS_BEGIN..CUTS_END block, or None."""
-    # Tolerate variations: cuts_begin, CUT_BEGIN, **CUTS_BEGIN**, etc.
+    """Return the content of the LAST CUTS_BEGIN..CUTS_END block, or None.
+
+    Leading `\\b` matters — without it, a prefix like `DRAFT_CUTS_BEGIN` would
+    match because `_` is a regex word char (no boundary between `T` and `_C`).
+    With the leading `\\b`, we only match when "CUTS_BEGIN" is preceded by a
+    non-word character (newline, whitespace, start of string)."""
     pat = re.compile(
-        r"CUTS?_BEGIN\b(.*?)\bCUTS?_END\b",
+        r"\bCUTS?_BEGIN\b(.*?)\bCUTS?_END\b",
         re.IGNORECASE | re.DOTALL,
     )
     matches = pat.findall(text)
@@ -192,6 +196,42 @@ def trim_silences_within_keeps(
         if cursor < ke:
             new_keeps.append((cursor, ke))
     return new_keeps
+
+
+def enforce_budget(
+    cuts: List[Tuple[float, float]],
+    duration: float,
+    ceiling_frac: float = 0.65,
+) -> tuple[List[Tuple[float, float]], bool]:
+    """Final safety net: if total cut time exceeds ceiling_frac of duration,
+    drop the LONGEST cuts in descending order until under budget.
+
+    This runs after the LLM revision call. If the model both over-cut on the
+    first pass AND failed to fix it in the revision, this trims the largest
+    cuts (which are the most likely to be over-aggressive sweeps) until the
+    keep fraction is at least 1 - ceiling_frac.
+
+    Returns (cuts_under_budget, was_trimmed). was_trimmed=True means the
+    pipeline should print a warning so the user knows the model couldn't
+    self-correct.
+    """
+    max_cut_s = duration * ceiling_frac
+    total = sum(e - s for s, e in cuts)
+    if total <= max_cut_s:
+        return cuts, False
+
+    # Drop longest first. Sort indices by cut length descending; pop until under.
+    indexed = list(enumerate(cuts))
+    indexed.sort(key=lambda ic: ic[1][1] - ic[1][0], reverse=True)
+    keep_mask = [True] * len(cuts)
+    dropped_total = 0.0
+    for orig_i, (s, e) in indexed:
+        if total - dropped_total <= max_cut_s:
+            break
+        keep_mask[orig_i] = False
+        dropped_total += e - s
+    out = [c for c, k in zip(cuts, keep_mask) if k]
+    return out, True
 
 
 def cuts_to_keeps(cuts: List[Tuple[float, float]], duration: float) -> List[Tuple[float, float]]:

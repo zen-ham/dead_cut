@@ -8,7 +8,7 @@ from .download import download
 from .transcribe import transcribe
 from .loudness import analyze as analyze_loudness
 from .llm import detect_cuts
-from .parser import parse_cuts, cuts_to_keeps, snap_cuts_to_silence, trim_silences_within_keeps
+from .parser import parse_cuts, cuts_to_keeps, snap_cuts_to_silence, trim_silences_within_keeps, enforce_budget
 from .cutter import cut_video
 from . import progress
 
@@ -128,6 +128,20 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
     # Show the AI's cut decision IMMEDIATELY — user can see whether the model
     # engaged or was lazy before waiting on snap/trim/encode.
     _print_cut_stats(len(cuts_raw), duration)
+
+    # Final safety net: if the model + revision both failed to stay under the
+    # 65% budget, drop the longest cuts programmatically. This runs even when
+    # detect_cuts already triggered a revision — that's intentional: it only
+    # trims if STILL over budget after revision.
+    cuts_raw, was_trimmed = enforce_budget(cuts_raw, duration, ceiling_frac=0.65)
+    if was_trimmed:
+        new_total = sum(e - s for s, e in cuts_raw)
+        new_pct = 100.0 * new_total / max(duration, 1e-6)
+        print(
+            f"\n[WARNING] programmatic drop applied — LLM still over budget after "
+            f"revision. Trimmed to {len(cuts_raw)} cuts ({new_pct:.1f}% of source). "
+            f"This is the safety net firing because the model couldn't self-correct.\n"
+        )
 
     if snap and loud.get("silences"):
         cuts = snap_cuts_to_silence(cuts_raw, loud["silences"], tolerance_s=SNAP_TOLERANCE_S)
