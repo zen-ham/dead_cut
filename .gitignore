@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+# Local cache (lives in outer dir but ignore here too just in case)
+cache/
+*.mp4
+*.mkv
+*.webm
+*.m4a
+*.wav
+*.mp3
+# Model files
+models/

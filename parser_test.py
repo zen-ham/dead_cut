@@ -1,0 +1,124 @@
+"""Test the parser handles the LLM output formats we expect, plus the
+adversarial cases the user warned about."""
+from .parser import parse_cuts, cuts_to_keeps
+
+
+def _expect(actual, expected, label):
+    assert actual == expected, f"{label}: expected {expected}, got {actual}"
+    print(f"  ok: {label}")
+
+
+def run():
+    print("[parser_test] running")
+
+    # 1. Basic cut block parses.
+    r = parse_cuts("""
+    Some reasoning here.
+    CUTS_BEGIN
+    00:00:00-00:01:21
+    00:05:34-00:08:12
+    CUTS_END
+    """)
+    _expect(r, [(0.0, 81.0), (334.0, 492.0)], "basic block")
+
+    # 2. mm:ss form also works.
+    r = parse_cuts("CUTS_BEGIN\n1:21-4:14\n5:34-8:12\nCUTS_END")
+    _expect(r, [(81.0, 254.0), (334.0, 492.0)], "mm:ss form")
+
+    # 3. KEY ADVERSARIAL CASE: model says "keep 9:13-10:40" in prose. Must NOT cut it.
+    r = parse_cuts("""
+    The intro is boring 0:00-1:21. We should DEFINITELY keep 9:13-10:40 because
+    that's the funniest bit. Also cut 12:00-13:00.
+    CUTS_BEGIN
+    0:00-1:21
+    12:00-13:00
+    CUTS_END
+    """)
+    _expect(r, [(0.0, 81.0), (720.0, 780.0)], "prose with 'keep' range ignored")
+
+    # 4. Overlapping ranges merge.
+    r = parse_cuts("CUTS_BEGIN\n1:00-2:00\n1:30-2:30\n3:00-3:30\nCUTS_END")
+    _expect(r, [(60.0, 150.0), (180.0, 210.0)], "overlap merge")
+
+    # 5. Out-of-order ranges sort.
+    r = parse_cuts("CUTS_BEGIN\n3:00-3:30\n1:00-1:30\nCUTS_END")
+    _expect(r, [(60.0, 90.0), (180.0, 210.0)], "out-of-order sort")
+
+    # 6. Tolerates bullet/dash prefixes and bold markers around the keywords.
+    r = parse_cuts("""
+    **CUTS_BEGIN**
+    - 0:00-0:30
+    * 1:00-1:30
+    **CUTS_END**
+    """)
+    _expect(r, [(0.0, 30.0), (60.0, 90.0)], "bullets + bold markers")
+
+    # 7. If there are multiple blocks, only the LAST one is used (model might
+    #    show an "example" block above the real answer).
+    r = parse_cuts("""
+    Example format:
+    CUTS_BEGIN
+    99:99-99:99
+    CUTS_END
+
+    My actual answer:
+    CUTS_BEGIN
+    0:00-0:10
+    CUTS_END
+    """)
+    _expect(r, [(0.0, 10.0)], "last block wins")
+
+    # 8. Invalid range (end <= start) is dropped silently.
+    r = parse_cuts("CUTS_BEGIN\n2:00-1:00\n3:00-4:00\nCUTS_END")
+    _expect(r, [(180.0, 240.0)], "invalid range dropped")
+
+    # 9. No block = ValueError.
+    try:
+        parse_cuts("just some text with 1:00-2:00 in it")
+        raise AssertionError("expected ValueError for missing block")
+    except ValueError:
+        print("  ok: missing block raises")
+
+    # 9b. Non-breaking hyphens (U+2011) and en/em dashes all parse — caught in
+    #     iter 2 of the test video where gpt-oss-120b used U+2011 throughout.
+    r = parse_cuts("CUTS_BEGIN\n00:00:00‑0:01:00\n00:02:00—0:02:30\n00:03:00–0:03:45\nCUTS_END")
+    _expect(r, [(0.0, 60.0), (120.0, 150.0), (180.0, 225.0)], "non-breaking hyphen + em dash + en dash")
+
+    # 9c. Duration-aware filter drops mixed-format ranges where end parses as
+    #     hours instead of seconds. Caught in iter 3 of the test video where
+    #     gpt-oss-120b emitted `00:00:45-02:30:00` meaning "45s to 2:30" but
+    #     parsing as HH:MM:SS gave end=9000s on a 1674s video.
+    r = parse_cuts(
+        "CUTS_BEGIN\n00:00:00-00:00:45\n00:00:45-02:30:00\n00:03:00-00:04:00\nCUTS_END",
+        max_duration=1674,
+    )
+    # The bad range (45s to 9000s, but 9000 > duration) gets clamped end -> 1674s
+    # so it actually swallows the rest of the video. To DROP rather than clamp,
+    # the model needs to use a sane start. Here start=45 < 1674 so it's kept and
+    # clamped. Clamping is the right call — there's no way to know whether the
+    # model meant 2:30 (150s) or 2:30:00 (9000s).
+    # After merge: (0,45) + (45,1674) = (0,1674), with (180,240) overlapping inside.
+    _expect(r, [(0.0, 1674.0)], "duration clamp on mixed-format range")
+
+    # 9d. Range entirely beyond duration is dropped.
+    r = parse_cuts(
+        "CUTS_BEGIN\n00:00:00-00:00:30\n05:00:00-06:00:00\nCUTS_END",
+        max_duration=1674,
+    )
+    _expect(r, [(0.0, 30.0)], "fully out-of-bounds range dropped")
+
+    # 10. cuts_to_keeps inverts correctly.
+    keeps = cuts_to_keeps([(0.0, 81.0), (334.0, 492.0)], duration=600.0)
+    _expect(keeps, [(81.0, 334.0), (492.0, 600.0)], "cuts_to_keeps basic")
+
+    keeps = cuts_to_keeps([], duration=600.0)
+    _expect(keeps, [(0.0, 600.0)], "cuts_to_keeps empty cuts")
+
+    keeps = cuts_to_keeps([(0.0, 600.0)], duration=600.0)
+    _expect(keeps, [], "cuts_to_keeps full cut")
+
+    print("[parser_test] ALL PASS")
+
+
+if __name__ == "__main__":
+    run()
