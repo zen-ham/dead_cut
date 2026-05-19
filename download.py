@@ -1,8 +1,71 @@
 """Download source video with yt-dlp."""
 import os
+import subprocess
+
 import yt_dlp
 
 from .cache import cache_dir
+
+
+# Codecs that lack hardware decode on common Turing GPUs (GTX 16xx, RTX 20xx).
+# Only AV1 is the problem in practice — every other relevant codec has had
+# NVDEC support since Maxwell. Ampere (RTX 30xx) added AV1 NVDEC, but the
+# warning is still useful because the bottleneck is the SAME on any pre-Ampere
+# GPU (and that's still the majority of consumer cards).
+_SLOW_DECODE_CODECS = {
+    "av1": (
+        "no AV1 hardware decoder on Turing GPUs (GTX 16xx, RTX 20xx) — "
+        "only Ampere (RTX 30xx) and newer have it. ffmpeg will fall back to "
+        "CPU AV1 decode, which is ~3-5x slower than NVDEC on H.264. "
+        "Re-download forcing H.264 via vcodec^=avc1 in your yt-dlp selector "
+        "if your GPU is older than Ampere."
+    ),
+}
+
+
+def _video_codec(path: str) -> str | None:
+    """ffprobe the first video stream's codec name. Returns None on failure."""
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        return (r.stdout or "").strip() or None
+    except Exception:
+        return None
+
+
+def _warn_if_slow_codec(path: str) -> None:
+    """Loud banner-style warning if the downloaded source uses a codec known
+    to cripple GPU pipelines on common consumer cards. Better to scream now
+    than to silently take 4x longer through the rest of the pipeline."""
+    codec = _video_codec(path)
+    if codec is None:
+        return
+    if codec.lower() in _SLOW_DECODE_CODECS:
+        why = _SLOW_DECODE_CODECS[codec.lower()]
+        bar = "!" * 80
+        print()
+        print(bar)
+        print(f"!! [WARNING] source video codec is {codec.upper()}")
+        print("!!")
+        for line in why.split(". "):
+            line = line.strip(". ")
+            if line:
+                print(f"!! {line}.")
+        print("!!")
+        print(f"!! Expect this pipeline to run ~3-5x slower than with H.264.")
+        print(f"!! Source file: {path}")
+        print(bar)
+        print()
+    else:
+        print(f"[download] source video codec: {codec} (hw-decode friendly)")
 
 
 def download(url: str, video_id: str) -> str:
@@ -11,6 +74,10 @@ def download(url: str, video_id: str) -> str:
     out_path = os.path.join(out_dir, "source.mp4")
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
         print(f"[download] cache hit: {out_path}")
+        # Still check codec on cache hit — user might have a stale AV1 source
+        # from before the H.264 selector was added, and we want them to know
+        # the pipeline is about to be much slower than it could be.
+        _warn_if_slow_codec(out_path)
         return out_path
 
     # PREFER H.264 (vcodec=avc1) over AV1/VP9. YouTube serves AV1 as
@@ -62,6 +129,8 @@ def download(url: str, video_id: str) -> str:
                 # rename so downstream stages have a stable filename
                 target = os.path.join(out_dir, "source.mp4")
                 os.replace(p, target)
+                _warn_if_slow_codec(target)
                 return target
+            _warn_if_slow_codec(p)
             return p
     raise RuntimeError(f"yt-dlp finished but no source file found in {out_dir}")
