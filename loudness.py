@@ -53,6 +53,9 @@ def analyze(video_path: str, video_id: str, segments: list) -> dict:
     track_mean = float(np.mean(db))
     track_p90 = float(np.percentile(db, 90))
     loud_threshold = track_mean + 6.0  # 6 dB above mean = "loud" in this track
+    # Silence threshold: well below mean but with an absolute floor so
+    # quieter-overall tracks don't get the entire track flagged as silence.
+    silence_threshold = max(track_mean - 12.0, -45.0)
 
     win_secs = WINDOW_MS / 1000.0
     per_segment = []
@@ -69,13 +72,45 @@ def analyze(video_path: str, video_id: str, segments: list) -> dict:
             "loud_frac": round(float(np.mean(chunk > loud_threshold)), 3),
         })
 
+    # Detect silence runs for cut-boundary snapping. A run of ≥MIN_SILENCE_MS
+    # of windows below silence_threshold counts as a silence interval.
+    silences = _detect_silences(db, win_secs, silence_threshold, MIN_SILENCE_MS)
+
     result = {
         "track_mean_db": round(track_mean, 1),
         "track_p90_db": round(track_p90, 1),
         "loud_threshold_db": round(loud_threshold, 1),
+        "silence_threshold_db": round(silence_threshold, 1),
         "window_ms": WINDOW_MS,
+        "min_silence_ms": MIN_SILENCE_MS,
         "per_segment": per_segment,
+        "silences": silences,
     }
     save_json(out_path, result)
-    print(f"[loudness] mean={track_mean:.1f}dB p90={track_p90:.1f}dB thr={loud_threshold:.1f}dB")
+    print(f"[loudness] mean={track_mean:.1f}dB p90={track_p90:.1f}dB loud_thr={loud_threshold:.1f}dB "
+          f"silence_thr={silence_threshold:.1f}dB silences={len(silences)}")
     return result
+
+
+MIN_SILENCE_MS = 250  # natural inter-word pause; shorter is breath/clipping
+
+
+def _detect_silences(db: np.ndarray, win_secs: float, threshold_db: float, min_ms: int) -> list:
+    """Return list of (start_sec, end_sec) intervals where dB < threshold for ≥min_ms.
+    Each interval represents a snappable boundary candidate."""
+    min_windows = max(1, int(round(min_ms / 1000.0 / win_secs)))
+    is_silent = db < threshold_db
+    intervals = []
+    n = len(is_silent)
+    i = 0
+    while i < n:
+        if is_silent[i]:
+            j = i
+            while j < n and is_silent[j]:
+                j += 1
+            if j - i >= min_windows:
+                intervals.append([round(i * win_secs, 3), round(j * win_secs, 3)])
+            i = j
+        else:
+            i += 1
+    return intervals

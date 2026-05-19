@@ -1,6 +1,6 @@
 """Test the parser handles the LLM output formats we expect, plus the
 adversarial cases the user warned about."""
-from .parser import parse_cuts, cuts_to_keeps
+from .parser import parse_cuts, cuts_to_keeps, snap_cuts_to_silence
 
 
 def _expect(actual, expected, label):
@@ -116,6 +116,37 @@ def run():
 
     keeps = cuts_to_keeps([(0.0, 600.0)], duration=600.0)
     _expect(keeps, [], "cuts_to_keeps full cut")
+
+    # 11. snap_cuts_to_silence: snaps both boundaries when within tolerance.
+    cuts = [(60.0, 120.0)]
+    silences = [[59.5, 60.8], [119.2, 121.0]]
+    r = snap_cuts_to_silence(cuts, silences, tolerance_s=2.0)
+    _expect(r, [(59.5, 121.0)], "snap both boundaries")
+
+    # 12. Boundary outside tolerance is left alone.
+    cuts = [(60.0, 120.0)]
+    silences = [[55.0, 56.0], [125.0, 126.0]]   # too far from 60 / 120
+    r = snap_cuts_to_silence(cuts, silences, tolerance_s=2.0)
+    _expect(r, [(60.0, 120.0)], "no snap when outside tolerance")
+
+    # 13. Mid-word cut mimicking the v0 issue: cut planned end at 122.0 but
+    #     real silence ends at 123.5 (1.5s into "next speech"). Snap should
+    #     extend the cut to 123.5, removing the leading silence from next keep.
+    cuts = [(10.0, 122.0)]
+    silences = [[8.0, 11.5], [115.0, 123.5]]
+    r = snap_cuts_to_silence(cuts, silences, tolerance_s=2.0)
+    _expect(r, [(8.0, 123.5)], "extends cut to absorb leading silence")
+
+    # 14. Empty silences = no-op.
+    r = snap_cuts_to_silence([(10.0, 20.0)], [], tolerance_s=2.0)
+    _expect(r, [(10.0, 20.0)], "no silences = no-op")
+
+    # 15. Snap collapses overlapping snapped ranges.
+    cuts = [(10.0, 20.0), (21.0, 30.0)]
+    silences = [[19.5, 21.2]]  # both end and start get snapped near this silence
+    r = snap_cuts_to_silence(cuts, silences, tolerance_s=2.0)
+    # cut1 end snaps 20.0 -> 21.2, cut2 start snaps 21.0 -> 19.5, then merge
+    _expect(r, [(10.0, 30.0)], "overlapping snaps merge")
 
     print("[parser_test] ALL PASS")
 

@@ -14,9 +14,12 @@ def main():
                     help="Run through LLM but skip ffmpeg cut")
     ap.add_argument("--model", default=None,
                     help="Force a specific OpenRouter model id (e.g. qwen/qwen3.6-plus:free)")
+    ap.add_argument("--no-snap", action="store_true",
+                    help="Disable snap-to-silence post-process (for A/B comparison)")
     args = ap.parse_args()
     try:
-        run(args.url, iteration=args.iter, dry_run=args.dry_run, force_model=args.model)
+        run(args.url, iteration=args.iter, dry_run=args.dry_run,
+            force_model=args.model, snap=not args.no_snap)
     except KeyboardInterrupt:
         print("\n[main] interrupted")
         sys.exit(130)

@@ -3,6 +3,7 @@
 Strict rule: only ranges inside the FINAL CUTS_BEGIN..CUTS_END block count.
 Anything outside (reasoning prose, "keep these" mentions, etc.) is ignored.
 """
+import bisect
 import re
 from typing import List, Tuple
 
@@ -88,6 +89,52 @@ def _merge(ranges: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
         else:
             merged.append((s, e))
     return merged
+
+
+def snap_cuts_to_silence(
+    cuts: List[Tuple[float, float]],
+    silences: List[List[float]],
+    tolerance_s: float = 2.0,
+) -> List[Tuple[float, float]]:
+    """Snap each cut's start to the nearest silence_start and end to the nearest
+    silence_end within tolerance. This makes the surrounding KEEP regions:
+      - end on speech (cut starts when silence begins, not mid-word)
+      - begin on speech (cut ends when silence ends, not before next word)
+
+    Without snap the LLM's cut times land on transcript-segment boundaries,
+    which themselves often fall mid-sentence — producing mid-word cuts and
+    keeping pre-speech silence inside the next clip.
+
+    Args:
+      cuts: original cut ranges in seconds.
+      silences: list of [start, end] silence intervals from loudness analysis.
+      tolerance_s: max distance to snap; boundaries outside this are left alone.
+    """
+    if not silences or not cuts:
+        return cuts
+
+    silence_starts = sorted(s[0] for s in silences)
+    silence_ends = sorted(s[1] for s in silences)
+
+    def _nearest(target: float, sorted_list: List[float], tol: float) -> float:
+        i = bisect.bisect_left(sorted_list, target)
+        cands = []
+        if i > 0:
+            cands.append(sorted_list[i - 1])
+        if i < len(sorted_list):
+            cands.append(sorted_list[i])
+        if not cands:
+            return target
+        best = min(cands, key=lambda x: abs(x - target))
+        return best if abs(best - target) <= tol else target
+
+    snapped = []
+    for cs, ce in cuts:
+        new_cs = _nearest(cs, silence_starts, tolerance_s)
+        new_ce = _nearest(ce, silence_ends, tolerance_s)
+        if new_ce > new_cs:
+            snapped.append((new_cs, new_ce))
+    return _merge(snapped)
 
 
 def cuts_to_keeps(cuts: List[Tuple[float, float]], duration: float) -> List[Tuple[float, float]]:

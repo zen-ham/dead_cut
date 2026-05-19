@@ -7,11 +7,18 @@ from .download import download
 from .transcribe import transcribe
 from .loudness import analyze as analyze_loudness
 from .llm import detect_cuts
-from .parser import parse_cuts, cuts_to_keeps
+from .parser import parse_cuts, cuts_to_keeps, snap_cuts_to_silence
 from .cutter import cut_video
 
 
-def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | None = None) -> dict:
+# Snap tolerance: how far a cut boundary may be moved to land on a detected
+# silence. 2.0s catches typical transcript-segment misalignment without
+# distorting the model's intent.
+SNAP_TOLERANCE_S = 2.0
+
+
+def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | None = None,
+        snap: bool = True) -> dict:
     """Run the full pipeline. Returns a summary dict with stats + paths.
 
     iteration: if you tweak the prompt and want to re-call the LLM, bump this
@@ -38,8 +45,21 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
     model, raw = detect_cuts(vid, duration, segments, loud_per_seg,
                              iteration=iteration, force_model=force_model)
 
-    # 5. Parse + invert (pass duration so malformed ranges get dropped/clamped)
-    cuts = parse_cuts(raw, max_duration=duration)
+    # 5. Parse + snap-to-silence + invert.
+    # Snap fixes the mid-word-cut / kept-silence problem: the LLM picks cuts
+    # against transcript-segment boundaries (which often fall mid-sentence),
+    # then we round each boundary to the nearest detected silence within
+    # SNAP_TOLERANCE_S. Disable with snap=False to compare A/B.
+    cuts_raw = parse_cuts(raw, max_duration=duration)
+    if snap and loud.get("silences"):
+        cuts = snap_cuts_to_silence(cuts_raw, loud["silences"], tolerance_s=SNAP_TOLERANCE_S)
+        snapped_n = sum(1 for a, b in zip(cuts_raw, cuts) if a != b)
+        print(f"[pipeline] snapped {snapped_n}/{len(cuts_raw)} cut boundaries to silence "
+              f"(tolerance {SNAP_TOLERANCE_S}s, {len(loud['silences'])} silences detected)")
+    else:
+        cuts = cuts_raw
+        if snap:
+            print("[pipeline] snap enabled but no silences in loudness cache — skipped")
     keeps = cuts_to_keeps(cuts, duration)
     cut_secs = sum(e - s for s, e in cuts)
     keep_secs = sum(e - s for s, e in keeps)
@@ -70,6 +90,8 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
         "keep_total_s": keep_secs,
         "keep_ranges": keeps,
         "cut_ranges": cuts,
+        "cut_ranges_pre_snap": cuts_raw if snap else None,
+        "snap_enabled": snap,
         "final_path": final_path if not dry_run else None,
         "elapsed_s": round(time.time() - t0, 1),
     }
