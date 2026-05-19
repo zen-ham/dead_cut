@@ -3,8 +3,10 @@ import os
 import subprocess
 
 import yt_dlp
+from tqdm import tqdm
 
 from .cache import cache_dir
+from . import progress
 
 
 # Codecs that lack hardware decode on common Turing GPUs (GTX 16xx, RTX 20xx).
@@ -86,6 +88,36 @@ def download(url: str, video_id: str) -> str:
     # CPU-decoding 3 hours of AV1 through a select filter is the difference
     # between a 5-min and a 40-min encode. The selector falls back to AV1
     # only when no H.264 stream is offered.
+    # Drive a proper tqdm bar from yt-dlp's progress_hooks so it lives at
+    # position=1 alongside the overall bar. Otherwise yt-dlp's raw printf
+    # progress lines clobber the overall bar at position=0 (they're not
+    # tqdm-aware, just stdout writes).
+    dl_bar = [None]
+    def _hook(d):
+        st = d.get("status")
+        if st == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            if total and dl_bar[0] is None:
+                fname = os.path.basename(d.get("filename", "source"))[:40]
+                dl_bar[0] = tqdm(
+                    total=total, unit="B", unit_scale=True,
+                    desc=f"[stage   ] download {fname}",
+                    position=1, leave=False,
+                    bar_format="{desc} {bar} {percentage:3.0f}% | {n_fmt}/{total_fmt} | eta {remaining}",
+                )
+            if dl_bar[0] is not None:
+                if total and dl_bar[0].total != total:
+                    dl_bar[0].total = total
+                dl_bar[0].n = d.get("downloaded_bytes", 0)
+                dl_bar[0].refresh()
+                progress.tick()
+        elif st == "finished":
+            if dl_bar[0] is not None:
+                dl_bar[0].n = dl_bar[0].total or dl_bar[0].n
+                dl_bar[0].refresh()
+                dl_bar[0].close()
+                dl_bar[0] = None
+
     ydl_opts = {
         "format": (
             "bestvideo[height<=720][vcodec^=avc1]+bestaudio/"
@@ -95,8 +127,12 @@ def download(url: str, video_id: str) -> str:
         ),
         "outtmpl": os.path.join(out_dir, "source.%(ext)s"),
         "merge_output_format": "mp4",
-        "quiet": False,
-        "noprogress": False,
+        # Suppress yt-dlp's own stdout output — the tqdm bar from _hook
+        # replaces it. Errors still print (quiet=True only kills info-level).
+        "quiet": True,
+        "noprogress": True,
+        "no_warnings": False,
+        "progress_hooks": [_hook],
         "retries": 5,
     }
     # YouTube bot-check now blocks anonymous downloads. Pull cookies from a
