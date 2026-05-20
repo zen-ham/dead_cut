@@ -31,11 +31,12 @@ _BASELINES = {
     "loudness":   ("source",   0.003),  # plus ~3s ffmpeg extract overhead
     "llm":        ("constant", 35.0),
     "post":       ("constant", 1.0),    # snap + trim (instant)
-    # encode: rough source-based estimate (assumes ~30% keep fraction × 0.20x
-    # per-output-second on H.264 source). Pipeline calls set_stage_baseline()
-    # with a refined value once snap+trim completes and we know the actual
-    # output duration.
-    "encode":     ("source",   0.06),
+    # encode: rough source-based estimate. Smartcut path encodes at ~0.07x
+    # of output duration on H.264 (stream-copies most of it); full-reencode
+    # fallback is ~0.20x. Pipeline calls set_stage_baseline() once snap+trim
+    # finishes with a refined value (output_dur × 0.08), and observed-rate
+    # reports from the cutter further refine it during encoding.
+    "encode":     ("source",   0.025),
 }
 
 _TRACKER = None  # module-level singleton; pipeline initialises, stages call.
