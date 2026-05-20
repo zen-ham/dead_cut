@@ -4,7 +4,7 @@ import subprocess
 import time
 
 from .cache import cache_dir, video_id_from_url, save_json
-from .download import download
+from .download import download, fetch_duration
 from .transcribe import transcribe
 from .loudness import analyze as analyze_loudness
 from .llm import detect_cuts
@@ -83,22 +83,34 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
     print(f"\n=== dead_cut: {url}  (id={vid}, iter={iteration}) ===\n")
     out_dir = cache_dir(vid)
 
-    # Init progress tracker BEFORE download so the overall bar covers the
-    # download stage too. We don't know source duration yet — the tracker
-    # uses a placeholder estimate (DEFAULT_SOURCE_S) and refines once
-    # download finishes and we can ffprobe the source.
-    progress.init()
+    # Init progress tracker BEFORE download so the overall bar covers it.
+    # Fetch source duration via cheap yt-dlp metadata call FIRST so the
+    # tracker's baselines (transcribe, encode etc. scale with source) are
+    # sized correctly from t=0. Without this, a 3hr vod gets sized as a
+    # 30min placeholder and the overall bar shows 60%+ during download.
+    cached_source = os.path.join(out_dir, "source.mp4")
+    if os.path.exists(cached_source) and os.path.getsize(cached_source) > 0:
+        try:
+            src_dur_pre = _ffprobe_duration(cached_source)
+        except Exception:
+            src_dur_pre = None
+    else:
+        print(f"[pipeline] fetching source metadata to size progress baselines...")
+        src_dur_pre = fetch_duration(url)
+    if src_dur_pre:
+        print(f"[pipeline] source ~{src_dur_pre/60.0:.1f} min\n")
+    progress.init(src_dur_pre)
 
     # 1. Download
     progress.begin_stage("download")
     video_path = download(url, vid)
     progress.end_stage("download")
 
-    # Now refine the overall estimate with the actual source duration.
+    # Refine again with actual ffprobed duration (metadata duration can be
+    # slightly off vs the actual decoded duration).
     try:
         src_dur = _ffprobe_duration(video_path)
         progress.set_source_duration(src_dur)
-        print(f"[pipeline] source ~{src_dur/60.0:.1f} min\n")
     except Exception:
         pass
 

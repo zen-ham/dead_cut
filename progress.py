@@ -90,10 +90,26 @@ class PipelineTracker:
         raise ValueError(f"unknown mode {mode}")
 
     def _total_estimate(self) -> float:
-        return sum(
-            self.actual_elapsed.get(s, self._estimate(s))
-            for s in _BASELINES
-        )
+        """Total seconds we expect the pipeline to take. For each stage:
+        - completed: use actual elapsed
+        - in flight: use max(baseline, current_elapsed_in_stage) — this is
+          the key bit. Without this, an in-flight stage that exceeds its
+          baseline (e.g. download taking 5min instead of 30s placeholder)
+          doesn't push the total, so the overall bar overshoots into
+          fake-near-completion territory.
+        - not started: use baseline
+        """
+        now = time.time()
+        total = 0.0
+        for s in _BASELINES:
+            if s in self.actual_elapsed:
+                total += self.actual_elapsed[s]
+            elif s in self._stage_starts:
+                in_progress = now - self._stage_starts[s]
+                total += max(self._estimate(s), in_progress)
+            else:
+                total += self._estimate(s)
+        return total
 
     def begin_stage(self, name: str) -> None:
         if name in _BASELINES:
@@ -110,14 +126,14 @@ class PipelineTracker:
             self.tick()
 
     def tick(self) -> None:
-        """Update the overall bar from wall-clock elapsed. Called frequently
-        from inside per-stage progress callbacks."""
+        """Update the overall bar from wall-clock elapsed. Recomputes the
+        dynamic total each tick so in-flight stages that run long push the
+        total out instead of letting the bar overshoot."""
         elapsed = int(time.time() - self.start_time)
-        # Don't show >100%; if a stage runs longer than its baseline we just
-        # cap at total. The total gets refreshed at stage end with actuals.
-        if elapsed > self.overall.total:
-            self.overall.total = elapsed  # let the bar keep moving past the estimate
-        self.overall.n = elapsed
+        new_total = int(self._total_estimate())
+        if new_total != self.overall.total:
+            self.overall.total = new_total
+        self.overall.n = min(elapsed, self.overall.total)
         self.overall.refresh()
 
     def close(self) -> None:

@@ -70,6 +70,41 @@ def _warn_if_slow_codec(path: str) -> None:
         print(f"[download] source video codec: {codec} (hw-decode friendly)")
 
 
+class _NullLogger:
+    """Silence yt-dlp's print-style cookie-extraction errors during the
+    metadata probe. We try browsers in order and tolerate failures — there's
+    no point spamming the user with chrome-not-installed errors when firefox
+    works fine on the next attempt."""
+    def debug(self, msg): pass
+    def info(self, msg): pass
+    def warning(self, msg): pass
+    def error(self, msg): pass
+
+
+def fetch_duration(url: str) -> float | None:
+    """Lightweight metadata-only call to yt-dlp. Returns the video duration in
+    seconds, or None on failure. Used to size the progress tracker's baselines
+    BEFORE the actual download so the overall ETA is realistic from t=0.
+
+    Roughly 2-5s to complete. Tries cookies from the same browsers as the real
+    download so it doesn't fail on age-gated/private content."""
+    info_opts = {
+        "quiet": True, "no_warnings": True, "skip_download": True,
+        "logger": _NullLogger(),
+    }
+    for browser in ("chrome", "firefox", "edge"):
+        try:
+            opts = dict(info_opts, cookiesfrombrowser=(browser,))
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                d = info.get("duration")
+                if d:
+                    return float(d)
+        except Exception:
+            continue
+    return None
+
+
 def download(url: str, video_id: str) -> str:
     """Download best mp4 (video+audio merged) to cache/<id>/source.mp4. Returns path."""
     out_dir = cache_dir(video_id)
