@@ -241,16 +241,23 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
     }
     save_json(os.path.join(out_dir, f"summary_iter{iteration}.json"), summary)
 
-    # End-of-run summary block: before/after timings now that we know the
-    # actual trimmed output size. Print after `[pipeline] DONE`.
+    # End-of-run summary block: before/after timings + cut counts now that
+    # we know the actual trimmed output size. Print after `[pipeline] DONE`.
     pct_kept = 100.0 * keep_secs / max(duration, 1e-6)
+    ai_removed = max(0.0, duration - keep_secs_pre)
+    silence_removed = max(0.0, keep_secs_pre - keep_secs)
+    # Each silence removed inside a keep splits 1 keep into 2 sub-keeps,
+    # so the silence cut count equals the increase in keep-range count.
+    silence_cut_count = max(0, len(keeps) - len(keeps_pre_trim))
     print()
     print(f"  [final summary]")
-    print(f"    source:         {_hms(duration)}")
-    print(f"    after LLM cuts: {_hms(keep_secs_pre)}  ({100*keep_secs_pre/duration:.1f}% of source)")
-    print(f"    after trim:     {_hms(keep_secs)}  ({pct_kept:.1f}% of source)")
-    print(f"    total removed:  {_hms(duration-keep_secs)}  ({100-pct_kept:.1f}%)")
-    print(f"    output:         {final_path}")
-    print(f"    elapsed:        {summary['elapsed_s']}s")
+    print(f"    source duration:       {_hms(duration)}")
+    print(f"    AI macro cuts:         {len(cuts)}  (removed {_hms(ai_removed)})")
+    print(f"    after AI cuts:         {_hms(keep_secs_pre)}  ({100*keep_secs_pre/duration:.1f}% of source)")
+    print(f"    silence micro-cuts:    {silence_cut_count}  (removed {_hms(silence_removed)})")
+    print(f"    after silence trim:    {_hms(keep_secs)}  ({pct_kept:.1f}% of source)")
+    print(f"    total removed:         {_hms(duration-keep_secs)}  ({100-pct_kept:.1f}%)")
+    print(f"    output:                {final_path}")
+    print(f"    elapsed:               {summary['elapsed_s']}s")
     print()
     return summary
