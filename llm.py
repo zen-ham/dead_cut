@@ -96,6 +96,17 @@ def call_llm(system: str, user: str, force_model: str | None = None) -> tuple[st
     raise RuntimeError("All OpenRouter models failed")
 
 
+def _extract_highlights_block(response: str) -> str:
+    """Return the raw HIGHLIGHTS block text from a primary response, or empty
+    string if not found. Used to remind the model in both revision messages
+    which moments it committed to keeping."""
+    m = re.search(
+        r"HIGHLIGHTS_BEGIN\b(.*?)\bHIGHLIGHTS_END",
+        response, re.DOTALL | re.IGNORECASE,
+    )
+    return m.group(1).strip() if m else ""
+
+
 def revise_cuts_over_budget(
     model: str,
     system: str,
@@ -108,36 +119,59 @@ def revise_cuts_over_budget(
     """Send a second message to the model with its original response in context,
     telling it the cut budget was exceeded and to reconsider.
 
-    This effectively turns a non-thinking model into a one-step-thinking model:
-    the original output IS the thought, this second turn is the revision. Most
-    of the time the first response is fine and this isn't called. When the
-    model massively over-cuts, this lets it correct itself with full awareness
-    of what it just emitted, before we resort to programmatic dropping.
+    Tone/scope matches the GAP between actual and target. A 3% overshoot
+    gets a 'trim a tiny bit' message; a 25% overshoot gets a 'restructure
+    significantly' message. Blunt 'cut less' regardless of gap caused
+    overcorrection in both directions.
 
     Returns the revised assistant response, or None on failure.
     """
     cut_secs = duration_s * (actual_cut_pct / 100.0)
     target_secs = duration_s * (target_pct / 100.0)
+    gap_pct = actual_cut_pct - target_pct  # how much MORE they cut than target
+    gap_secs = duration_s * (gap_pct / 100.0)
+    gap_min = gap_secs / 60.0
+
+    if gap_pct < 7:
+        scope = (
+            f"You're only {gap_pct:.1f}% over target — that's about "
+            f"{gap_min:.1f} minutes of cut to drop. Pick 1-3 of your "
+            f"LEAST confident cuts (vague reasons, low-evidence) and drop "
+            f"them entirely. Keep everything else the same."
+        )
+    elif gap_pct < 20:
+        scope = (
+            f"You're {gap_pct:.1f}% over target — about {gap_min:.1f} "
+            f"minutes too much cut. Look through your cuts and drop the "
+            f"ones with the weakest reasons (generic 'no jokes', vague "
+            f"'low energy', etc). Aim to drop 3-8 cuts spread across the "
+            f"timeline (not just the last few). Keep the cuts with strong "
+            f"specific reasons (quoted boring lines, clear dead air)."
+        )
+    else:
+        scope = (
+            f"You're WAY over target — {gap_pct:.1f}% too much cut "
+            f"({gap_min:.0f} minutes excess). This usually means you "
+            f"block-chunked the runtime instead of finding specific "
+            f"boring sections. Restart your thinking: keep only cuts "
+            f"where you can quote a SPECIFIC boring line or point to a "
+            f"long stretch of L=0.0 dead air. If you can't justify a "
+            f"cut with a concrete reason, drop it. Drop cuts spatially "
+            f"distributed, not just sequential ones."
+        )
+
     correction = (
-        f"Your CUTS_BEGIN..CUTS_END block totals approximately "
-        f"{cut_secs:.0f}s, which is {actual_cut_pct:.1f}% of the {duration_s:.0f}s "
-        f"video. That exceeds the 75% maximum — the response will be rejected.\n\n"
-        f"This usually happens when CANDIDATES became contiguous chunks of the "
-        f"whole runtime (block-chunking) instead of specific boring sections. "
-        f"To fix:\n\n"
-        f"1. Look at your HIGHLIGHTS list — those time windows MUST stay (don't "
-        f"cut them).\n"
-        f"2. Look at the rest — drop any cut range whose reason was vague or "
-        f"generic. Keep only cuts where you can clearly point to a boring "
-        f"transcript line, dead air (L=0.0 stretches), tutorial readouts, "
-        f"obvious repetition. Drop cuts SPATIALLY DISTRIBUTED, not just the "
-        f"last few in the list.\n"
-        f"3. The final cuts should NOT form one giant contiguous range — if "
-        f"they merge into a single block, you're still chunking.\n\n"
-        f"Aim for total cut ≤ {target_pct:.0f}% (≈{target_secs:.0f}s max).\n\n"
+        f"Your CUTS_BEGIN..CUTS_END block totals {cut_secs:.0f}s = "
+        f"{actual_cut_pct:.1f}% of the {duration_s:.0f}s video. The "
+        f"75% ceiling is exceeded — needs revision to ≤ {target_pct:.0f}% "
+        f"(≈{target_secs:.0f}s max).\n\n"
+        f"{scope}\n\n"
+        f"Also: do NOT cut any of these HIGHLIGHTS you committed to "
+        f"earlier:\n"
+        f"{_extract_highlights_block(original_response)}\n\n"
         f"Output ONLY a new CUTS_BEGIN..CUTS_END block with the revised list. "
-        f"Nothing before or after. Same format rules apply (HH:MM:SS-HH:MM:SS, "
-        f"one per line)."
+        f"Nothing before or after. Same format rules apply "
+        f"(HH:MM:SS-HH:MM:SS — reason, one per line)."
     )
     messages = [
         {"role": "system", "content": system},
@@ -169,39 +203,47 @@ def revise_cuts_under_floor(
     edits and the model was too conservative."""
     cut_secs = duration_s * (actual_cut_pct / 100.0)
     target_secs = duration_s * (target_pct / 100.0)
-    # Extract the highlights the model already committed to. These are the
-    # moments it identified as worth keeping; revision must NOT cut them.
-    hl_match = re.search(
-        r"HIGHLIGHTS_BEGIN(.*?)HIGHLIGHTS_END",
-        original_response, re.DOTALL,
-    )
-    highlights_block = hl_match.group(1).strip() if hl_match else ""
+    gap_pct = target_pct - actual_cut_pct  # how much MORE they need to cut
+    gap_secs = duration_s * (gap_pct / 100.0)
+    gap_min = gap_secs / 60.0
+    highlights_block = _extract_highlights_block(original_response)
+
+    if gap_pct < 7:
+        scope = (
+            f"You're only {gap_pct:.1f}% short — about {gap_min:.1f} "
+            f"more minutes to cut. Add 1-3 more SHORT cut ranges (30s-2min "
+            f"each) from stretches you might have overlooked. Keep all your "
+            f"existing cuts — just add a small handful more."
+        )
+    elif gap_pct < 20:
+        scope = (
+            f"You're {gap_pct:.1f}% short of the 50% minimum — about "
+            f"{gap_min:.1f} more minutes to cut. Look for several more "
+            f"boring stretches you missed: long narrative gameplay describing "
+            f"actions without jokes ('I'm gonna check this'), repeated "
+            f"complaint loops, inventory/menu shuffling. ADD 3-8 more cut "
+            f"ranges to your existing list — don't change the cuts you "
+            f"already had."
+        )
+    else:
+        scope = (
+            f"You're significantly under target — need {gap_pct:.1f}% more "
+            f"cut ({gap_min:.0f} minutes). You probably labeled too much "
+            f"mid-energy content as 'entertaining'. Even narrative game "
+            f"commentary that's not funny is fair to cut. Aim for many more "
+            f"cuts — 8-20 additional ranges, in parts of the video you "
+            f"didn't originally flag. Keep your existing cuts and add to them."
+        )
 
     correction = (
-        f"Your CUTS_BEGIN..CUTS_END block totals approximately "
-        f"{cut_secs:.0f}s, which is only {actual_cut_pct:.1f}% of the "
-        f"{duration_s:.0f}s video. The user wants tight edits — minimum 50% "
-        f"of the runtime must be cut. The response will be rejected.\n\n"
-        f"IMPORTANT: do NOT touch the cuts you already identified — those "
-        f"were good calls. Instead, ADD MORE cut ranges to your existing "
-        f"list. Find NEW boring stretches in parts of the video you didn't "
-        f"originally flag.\n\n"
-        f"AND DO NOT CUT THE HIGHLIGHTS YOU LISTED:\n"
+        f"Your CUTS_BEGIN..CUTS_END block totals only {cut_secs:.0f}s = "
+        f"{actual_cut_pct:.1f}% of the {duration_s:.0f}s video. Minimum cut "
+        f"is 50%, target ≥ {target_pct:.0f}% (≈{target_secs:.0f}s).\n\n"
+        f"{scope}\n\n"
+        f"CRITICAL: do NOT cut any of these HIGHLIGHTS:\n"
         f"{highlights_block}\n\n"
-        f"These are the moments you yourself said are entertainment. Cutting "
-        f"them after committing to them would be inconsistent. Any new cuts "
-        f"you add must NOT overlap with these times.\n\n"
-        f"Where to look for more boring stretches:\n"
-        f"1. LONG stretches (1-5+ min) of low-energy gameplay describing "
-        f"actions without jokes ('I'm gonna check this', 'where was I').\n"
-        f"2. Inventory shuffling, menu/map staring with no commentary.\n"
-        f"3. Tutorial readouts, popup text being read aloud.\n"
-        f"4. Repeated complaints / scared noises / 'where do I go' loops "
-        f"WITHOUT a comedic payoff.\n"
-        f"5. Intro filler, outro wrap-ups, donation/sub asks.\n\n"
-        f"Output a NEW CUTS_BEGIN..CUTS_END block containing BOTH your "
-        f"original cuts PLUS the new ones you've added. Aim for total cut "
-        f"≥ {target_pct:.0f}% (≈{target_secs:.0f}s). Same format rules apply "
+        f"Output a NEW CUTS_BEGIN..CUTS_END block with your ORIGINAL cuts "
+        f"PLUS new ones you've added. Nothing before or after. Same format "
         f"(HH:MM:SS-HH:MM:SS — reason, one per line)."
     )
     messages = [
