@@ -8,7 +8,7 @@ from .download import download, fetch_duration
 from .transcribe import transcribe
 from .loudness import analyze as analyze_loudness
 from .llm import detect_cuts
-from .parser import parse_cuts, cuts_to_keeps, snap_cuts_to_silence, trim_silences_within_keeps, enforce_budget
+from .parser import parse_cuts, cuts_to_keeps, snap_cuts_to_silence, trim_silences_within_keeps, enforce_budget, extract_highlights_from_response, protect_highlights
 from .cutter import cut_video
 from . import progress
 
@@ -129,8 +129,8 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
 
     # 4. LLM cut detection
     progress.begin_stage("llm")
-    model, raw = detect_cuts(vid, duration, segments, loud_per_seg,
-                             iteration=iteration, force_model=force_model)
+    model, raw, primary_raw = detect_cuts(vid, duration, segments, loud_per_seg,
+                                          iteration=iteration, force_model=force_model)
     progress.end_stage("llm")
 
     # 5. Parse + snap-to-silence + invert.
@@ -140,6 +140,19 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
     # SNAP_TOLERANCE_S. Disable with snap=False to compare A/B.
     progress.begin_stage("post")
     cuts_raw = parse_cuts(raw, max_duration=duration)
+
+    # Protect highlights programmatically: the model commits to a HIGHLIGHTS
+    # list (entertaining moments to keep) but empirically can contradict it
+    # in CUTS (especially after an under-floor revision asks for more cuts).
+    # Parse the highlights from the PRIMARY response — revised responses are
+    # cut-only with no HIGHLIGHTS block.
+    highlights = extract_highlights_from_response(primary_raw)
+    if highlights:
+        before_n = len(cuts_raw)
+        cuts_raw = protect_highlights(cuts_raw, highlights, padding_s=10.0)
+        if len(cuts_raw) != before_n:
+            print(f"[pipeline] protect_highlights split {before_n} cuts into "
+                  f"{len(cuts_raw)} to preserve {len(highlights)} highlights")
 
     # Show the AI's cut decision IMMEDIATELY — user can see whether the model
     # engaged or was lazy before waiting on snap/trim/encode.

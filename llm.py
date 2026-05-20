@@ -1,5 +1,6 @@
 """OpenRouter caller. Free models only, with fallback chain."""
 import os
+import re
 import time
 import requests
 
@@ -144,7 +145,7 @@ def revise_cuts_over_budget(
         {"role": "assistant", "content": original_response},
         {"role": "user", "content": correction},
     ]
-    print(f"[llm] revision request: model={model}, total {actual_cut_pct:.1f}% > 65% budget")
+    print(f"[llm] over-cut revision: model={model}, primary {actual_cut_pct:.1f}% > {BUDGET_CEILING*100:.0f}%")
     t0 = time.time()
     resp = _call_one(model, messages, timeout=240)
     if resp:
@@ -154,15 +155,78 @@ def revise_cuts_over_budget(
     return resp
 
 
-# Budget threshold for triggering a revision request. If the model's first-pass
-# CUTS exceed this fraction of source duration, ask it to reconsider. Set at
-# 75% to give the model real freedom — only catches egregious over-cutting.
+def revise_cuts_under_floor(
+    model: str,
+    system: str,
+    user: str,
+    original_response: str,
+    actual_cut_pct: float,
+    duration_s: float,
+    target_pct: float = 55.0,
+) -> str | None:
+    """Inverse of over-budget revision: model under-cut, ask for more.
+    Used when primary cuts came in below the 50% floor — user wants tight
+    edits and the model was too conservative."""
+    cut_secs = duration_s * (actual_cut_pct / 100.0)
+    target_secs = duration_s * (target_pct / 100.0)
+    # Extract the highlights the model already committed to. These are the
+    # moments it identified as worth keeping; revision must NOT cut them.
+    hl_match = re.search(
+        r"HIGHLIGHTS_BEGIN(.*?)HIGHLIGHTS_END",
+        original_response, re.DOTALL,
+    )
+    highlights_block = hl_match.group(1).strip() if hl_match else ""
+
+    correction = (
+        f"Your CUTS_BEGIN..CUTS_END block totals approximately "
+        f"{cut_secs:.0f}s, which is only {actual_cut_pct:.1f}% of the "
+        f"{duration_s:.0f}s video. The user wants tight edits — minimum 50% "
+        f"of the runtime must be cut. The response will be rejected.\n\n"
+        f"IMPORTANT: do NOT touch the cuts you already identified — those "
+        f"were good calls. Instead, ADD MORE cut ranges to your existing "
+        f"list. Find NEW boring stretches in parts of the video you didn't "
+        f"originally flag.\n\n"
+        f"AND DO NOT CUT THE HIGHLIGHTS YOU LISTED:\n"
+        f"{highlights_block}\n\n"
+        f"These are the moments you yourself said are entertainment. Cutting "
+        f"them after committing to them would be inconsistent. Any new cuts "
+        f"you add must NOT overlap with these times.\n\n"
+        f"Where to look for more boring stretches:\n"
+        f"1. LONG stretches (1-5+ min) of low-energy gameplay describing "
+        f"actions without jokes ('I'm gonna check this', 'where was I').\n"
+        f"2. Inventory shuffling, menu/map staring with no commentary.\n"
+        f"3. Tutorial readouts, popup text being read aloud.\n"
+        f"4. Repeated complaints / scared noises / 'where do I go' loops "
+        f"WITHOUT a comedic payoff.\n"
+        f"5. Intro filler, outro wrap-ups, donation/sub asks.\n\n"
+        f"Output a NEW CUTS_BEGIN..CUTS_END block containing BOTH your "
+        f"original cuts PLUS the new ones you've added. Aim for total cut "
+        f"≥ {target_pct:.0f}% (≈{target_secs:.0f}s). Same format rules apply "
+        f"(HH:MM:SS-HH:MM:SS — reason, one per line)."
+    )
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+        {"role": "assistant", "content": original_response},
+        {"role": "user", "content": correction},
+    ]
+    print(f"[llm] under-cut revision: model={model}, primary {actual_cut_pct:.1f}% < {BUDGET_FLOOR*100:.0f}%")
+    t0 = time.time()
+    resp = _call_one(model, messages, timeout=240)
+    if resp:
+        print(f"[llm] revision OK in {time.time()-t0:.1f}s, {len(resp)} chars")
+    else:
+        print(f"[llm] revision FAILED")
+    return resp
+
+
+# Budget thresholds. Two-sided: catch both over-cutting AND under-cutting.
+# Over: if primary > CEILING, revision asks to pull back to UNDER_TARGET.
+# Under: if primary < FLOOR, revision asks to be more aggressive, aiming OVER_TARGET.
 BUDGET_CEILING = 0.75
-# When revision fires, ask the model to aim for a MODERATE cut (not just
-# barely-under-ceiling). The thinking: if it over-shot the 75% line, its
-# judgment for THIS vod was probably miscalibrated; pulling back to ~55%
-# protects against losing too much content to over-eager cutting.
-REVISION_TARGET = 0.55
+REVISION_UNDER_TARGET = 0.55  # when over-cut, pull back to here
+BUDGET_FLOOR = 0.50
+REVISION_OVER_TARGET = 0.55   # when under-cut, push up to here
 
 
 def detect_cuts(
@@ -197,8 +261,14 @@ def detect_cuts(
     if os.path.exists(out_path):
         d = load_json(out_path)
         print(f"[llm] cache hit (iter {iteration}): {out_path}")
-        # Return revised if present, else primary.
-        return d["model"], d.get("revised_response") or d["response"]
+        # Return (model, final_response, primary_response). The primary is
+        # always returned separately because it's the one with HIGHLIGHTS
+        # (the revised response, when present, only has the CUTS block).
+        return (
+            d["model"],
+            d.get("revised_response") or d["response"],
+            d["response"],
+        )
 
     user_prompt = build_user_prompt(duration, segments, loudness_per_seg)
     if extra_user_suffix:
@@ -216,18 +286,31 @@ def detect_cuts(
         first_cuts = parse_cuts(resp, max_duration=duration)
         first_cut_secs = sum(e - s for s, e in first_cuts)
         cut_pct_first = 100.0 * first_cut_secs / max(duration, 1e-6)
+        revise_fn = None
+        revise_target = None
         if cut_pct_first / 100.0 > BUDGET_CEILING:
             print(
                 f"\n[WARNING] model over-cut on first pass: "
                 f"{len(first_cuts)} cuts totalling {cut_pct_first:.1f}% "
                 f"(ceiling {BUDGET_CEILING*100:.0f}%). Requesting revision...\n"
             )
-            revised_resp = revise_cuts_over_budget(
+            revise_fn = revise_cuts_over_budget
+            revise_target = REVISION_UNDER_TARGET * 100
+        elif cut_pct_first / 100.0 < BUDGET_FLOOR:
+            print(
+                f"\n[WARNING] model under-cut on first pass: "
+                f"{len(first_cuts)} cuts totalling {cut_pct_first:.1f}% "
+                f"(floor {BUDGET_FLOOR*100:.0f}%). Requesting revision...\n"
+            )
+            revise_fn = revise_cuts_under_floor
+            revise_target = REVISION_OVER_TARGET * 100
+        if revise_fn is not None:
+            revised_resp = revise_fn(
                 model=model, system=SYSTEM_PROMPT, user=user_prompt,
                 original_response=resp,
                 actual_cut_pct=cut_pct_first,
                 duration_s=duration,
-                target_pct=REVISION_TARGET * 100,
+                target_pct=revise_target,
             )
             if revised_resp:
                 final_resp = revised_resp
@@ -257,4 +340,7 @@ def detect_cuts(
         "iteration": iteration,
         "forced_model": force_model,
     })
-    return model, final_resp
+    # Return primary response too — it has the HIGHLIGHTS block (revised
+    # responses are just a CUTS block). Pipeline uses primary for highlight
+    # protection.
+    return model, final_resp, resp

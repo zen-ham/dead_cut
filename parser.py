@@ -198,6 +198,66 @@ def trim_silences_within_keeps(
     return new_keeps
 
 
+def extract_highlights_from_response(response: str) -> List[float]:
+    """Parse the HIGHLIGHTS_BEGIN..HIGHLIGHTS_END block and return the list
+    of highlight timestamps in seconds. Returns [] if no highlights block."""
+    m = re.search(r"HIGHLIGHTS_BEGIN\b(.*?)\bHIGHLIGHTS_END", response,
+                  re.DOTALL | re.IGNORECASE)
+    if not m:
+        return []
+    times: List[float] = []
+    ts_re = re.compile(r"\b(\d{1,2}):(\d{2})(?::(\d{2}))?\b")
+    for line in m.group(1).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Use the FIRST timestamp on the line (highlights are typically
+        # "HH:MM:SS — description")
+        tm = ts_re.search(line)
+        if not tm:
+            continue
+        a, b, c = tm.groups()
+        if c is not None:
+            times.append(int(a) * 3600 + int(b) * 60 + int(c))
+        else:
+            times.append(int(a) * 60 + int(b))
+    return times
+
+
+def protect_highlights(
+    cuts: List[Tuple[float, float]],
+    highlights: List[float],
+    padding_s: float = 10.0,
+) -> List[Tuple[float, float]]:
+    """Split or contract any cut that contains a highlight timestamp.
+    Preserves a 2*padding_s window around each highlight so the comedy
+    survives even when the model contradicts its own HIGHLIGHTS list.
+
+    Model is bad at following negative constraints ('don't cut highlight X')
+    — empirically even when told explicitly in the revision prompt, it
+    still cut 4/6 highlights on the test vod. This is the safety net:
+    parse highlight timestamps independently and physically prevent any
+    cut from swallowing them.
+    """
+    if not highlights or not cuts:
+        return cuts
+    out = []
+    for cs, ce in cuts:
+        contained = sorted(h for h in highlights if cs <= h <= ce)
+        if not contained:
+            out.append((cs, ce))
+            continue
+        current = cs
+        for h in contained:
+            cut_end = max(current, h - padding_s)
+            if cut_end > current + 0.5:
+                out.append((current, cut_end))
+            current = h + padding_s
+        if current < ce - 0.5:
+            out.append((current, ce))
+    return out
+
+
 def enforce_budget(
     cuts: List[Tuple[float, float]],
     duration: float,

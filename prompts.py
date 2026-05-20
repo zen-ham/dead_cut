@@ -22,38 +22,45 @@ Most of these videos are gaming streams, podcasts, or commentary — the \
 entertainment is the streamer's reactions, jokes, distinctive personality \
 moments, hype reactions, storytelling, AND dry / sarcastic / deadpan humor.
 
-CRITICAL — humor is often QUIET. Sarcastic asides, deadpan delivery, \
-absurdist bits (saying the same word 20 times, calling out game logic, \
-making references), and dark comedy are usually delivered at LOW volume \
-(L < 0.3). These are the entertainment. Do NOT cut them because they're \
-quiet. Common mistakes to avoid:
+YOU MUST CUT AT LEAST 50% OF THE VIDEO. The user is editing a long vod \
+down to a tight watch; under-cutting (keeping >50%) is failure. If your \
+cuts add up to under 50% of the runtime, you have not done the job — go \
+through the transcript again and find more boring stretches. Most lightly-\
+edited vods have plenty to remove; if you can't find 50% to cut, you're \
+not looking hard enough.
 
-  - "He says 'Ke-Ke-Ke-Ke-' 20 times, L=0.1, must be boring" → NO, that's \
-an absurdist comedy bit, that's the show. Keep it.
-  - "He's making jokes about a calculator trick in school, L=0.2, must be \
-filler" → NO, that's a memory-callback joke, that's content. Keep it.
-  - "He's dryly saying 'I do not care about your missing kid, man', L=0.15" \
-→ NO, that's dark humor / sarcastic commentary about the game. Keep it.
+WHAT TO CUT (most of the video):
 
-What's ACTUALLY boring (and safe to cut):
-
-  - Long silent navigation / walking with NO commentary at all (the lines \
-in the transcript would literally be empty or just brief utility words like \
-"there it is", "ok this way")
-  - The streamer literally reading the game's tutorial / popup text out loud \
-("Use WASD to move. Press F to interact.")
-  - Inventory shuffling / menu-staring with no commentary
+  - Silent navigation / walking with NO commentary
+  - Long inventory shuffling, menu-staring, looking at the map
+  - The streamer literally reading the game's tutorial / popup text aloud
   - "Anyway", "alright", "okay so", "where was I" filler with no follow-up
-  - Repeated "I'm scared" / "I don't want to go in there" loops without any \
-joke or personality
-  - Intro/outro filler (asking for likes, donation thanks, "thanks for \
-watching" wrap-ups)
+  - Drawn-out problem-solving where the streamer is just thinking out loud \
+without jokes ("hmm so I need to... wait... no... maybe I should...")
+  - Repeated complaints / "I'm scared" loops with no joke payoff
+  - Intro/outro fluff (subscribe asks, donation reads, "thanks for watching")
+  - Mid-energy commentary that's narrative but not funny — like the \
+streamer describing what they're doing in the game without any joke
+  - Any segment where you can summarise the whole thing in one sentence \
+without losing comedy
 
-Loudness (L) is a HINT but not authoritative. L=0.0 over 30+ seconds is \
-likely dead air worth cutting. L=0.1 with witty dialogue is NOT dead air — \
-it's just quiet humor. ALWAYS read the actual transcript text before \
-deciding a range is boring. If you can quote a joke / sarcastic line / \
-personality moment from the range, it's NOT a cut candidate.
+WHAT TO KEEP (the entertainment, often quiet):
+
+  - Sarcastic asides and deadpan delivery (often L < 0.3 — DO NOT cut)
+  - Absurdist bits (saying the same word 20 times, weird tangents)
+  - Dark humor and meta commentary about the game
+  - Memory-callbacks, school-reference jokes, weird analogies
+  - Hype moments, loud reactions, jump scares, big laughs
+  - Any segment where there's a real joke, even if it's quiet
+
+Loudness L is a HINT, NOT authoritative. L=0.0 for a sustained stretch = \
+dead air, cut. L=0.1 with a deadpan joke = entertainment, keep. Always \
+read the actual transcript text before deciding.
+
+EACH CUT SHOULD BE LONG — at least 30 seconds, ideally 1-5 minutes. Don't \
+emit 50 micro-cuts of 2-5 seconds each. There's a separate silence-trim \
+step that handles micro pauses. Your job is to identify the BIG boring \
+stretches.
 
 YOUR OUTPUT HAS EXACTLY TWO BLOCKS, IN THIS ORDER:
 
@@ -115,10 +122,9 @@ dead air — usually worth cutting.
 
 
 USER_PROMPT_HEADER = """Video duration: {duration_str} ({duration_sec:.0f} seconds)
-Target cut: roughly 30-60% of runtime (i.e. keep {min_keep_str}-{max_keep_str}). \
-If the video is mostly gold, cut less. If most is filler, cut more — but you \
-MUST keep at least {min_keep_str} of runtime ({min_keep_sec:.0f} seconds). \
-Cutting more than 75% will be rejected.
+Cut at LEAST 50% (target 50-75%). Output below 50% cut WILL be rejected — the \
+user wants tight edits. Stay under 75% to keep enough content for it to flow. \
+For this video specifically, aim to cut between {min_cut_str} and {max_cut_str}.
 
 EXPECTED CUT COUNT for a video this length: aim for {cut_target_low}-{cut_target_high} \
 distinct cut ranges. Fewer than {cut_target_low_strict} means you're being lazy. \
@@ -149,18 +155,18 @@ def _hms(t: float) -> str:
 
 
 def build_user_prompt(duration: float, segments: list, loudness_per_seg: list) -> str:
-    min_keep_sec = duration * 0.25
-    max_keep_sec = duration * 0.70
+    # 50% MIN cut, 75% MAX cut.
+    min_cut_sec = duration * 0.50
+    max_cut_sec = duration * 0.75
     duration_min = duration / 60.0
-    cut_target_low = max(8, int(round(duration_min * 0.5)))
-    cut_target_high = max(15, int(round(duration_min * 0.8)))
-    cut_target_low_strict = max(5, int(round(duration_min * 0.3)))
+    cut_target_low = max(5, int(round(duration_min * 0.25)))   # longer cuts now
+    cut_target_high = max(10, int(round(duration_min * 0.5)))
+    cut_target_low_strict = max(3, int(round(duration_min * 0.15)))
     header = USER_PROMPT_HEADER.format(
         duration_str=_hms(duration),
         duration_sec=duration,
-        min_keep_str=_hms(min_keep_sec),
-        max_keep_str=_hms(max_keep_sec),
-        min_keep_sec=min_keep_sec,
+        min_cut_str=_hms(min_cut_sec),
+        max_cut_str=_hms(max_cut_sec),
         cut_target_low=cut_target_low,
         cut_target_high=cut_target_high,
         cut_target_low_strict=cut_target_low_strict,
