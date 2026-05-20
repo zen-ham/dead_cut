@@ -222,22 +222,26 @@ def _splice_audio(
         if rc != 0:
             raise RuntimeError(f"audio extract failed:\n{stderr_tail[-1500:]}")
 
-    # 2. Splice in Python via soundfile's seek-based reads.
+    # 2. Splice in Python. Read source wav via raw byte I/O — libsndfile's
+    # seek breaks on Windows once you're >~1.4GB into a wav file (internal
+    # 32-bit-signed offset overflow), and the standard PCM WAV layout is
+    # trivial to parse manually: header (data offset), then samples laid out
+    # contiguously. Output wav is written via soundfile (no seeking on the
+    # output side, just sequential writes — that's fine).
     info = sf.info(full_wav)
     real_sr = info.samplerate
     real_ch = info.channels
+    sample_bytes = real_ch * 2  # int16 = 2 bytes per channel sample
+    data_offset, _ = _wav_data_chunk(full_wav)
     total_samples = sum(int(round((e - s) * real_sr)) for s, e in keep_ranges)
     print(f"[cutter] splicing {len(keep_ranges)} audio segments "
           f"({total_samples/real_sr:.1f}s output) in Python...")
-    # Keep the source wav open across all reads — avoids reopening the 2GB+
-    # file 600+ times and is meaningfully faster than the sf.read(path)-per-range
-    # form which closes and reopens between each read.
     pbar = tqdm(
         total=len(keep_ranges), unit="seg", desc="[stage   ] audio splice",
         bar_format="{desc} {bar} {percentage:3.0f}% | {n}/{total} segs | eta {remaining}",
         position=1, leave=False,
     )
-    with sf.SoundFile(full_wav, mode="r") as f_in, \
+    with open(full_wav, "rb") as f_in, \
          sf.SoundFile(out_wav, mode="w", samplerate=real_sr,
                       channels=real_ch, subtype="PCM_16") as f_out:
         for s, e in keep_ranges:
@@ -246,13 +250,39 @@ def _splice_audio(
             if end_sample <= start_sample:
                 pbar.update(1)
                 continue
-            f_in.seek(start_sample)
-            chunk = f_in.read(end_sample - start_sample, dtype="int16", always_2d=True)
-            f_out.write(chunk)
+            byte_offset = data_offset + start_sample * sample_bytes
+            byte_count = (end_sample - start_sample) * sample_bytes
+            f_in.seek(byte_offset)
+            buf = f_in.read(byte_count)
+            arr = np.frombuffer(buf, dtype=np.int16).reshape(-1, real_ch)
+            f_out.write(arr)
             pbar.update(1)
             progress.tick()
     pbar.close()
     return out_wav
+
+
+def _wav_data_chunk(wav_path: str) -> tuple[int, int]:
+    """Parse a standard PCM WAV header and return (data_offset, data_size).
+
+    Standard layout: 'RIFF' + 4-byte file size + 'WAVE', followed by a series
+    of chunks each with 4-byte ID + 4-byte size + payload. We walk chunks
+    until we find 'data' and return its payload offset + size.
+    """
+    with open(wav_path, "rb") as f:
+        riff = f.read(12)
+        if riff[:4] != b"RIFF" or riff[8:12] != b"WAVE":
+            raise RuntimeError(f"not a WAV file: {wav_path}")
+        while True:
+            chunk_header = f.read(8)
+            if len(chunk_header) < 8:
+                raise RuntimeError(f"no 'data' chunk in {wav_path}")
+            chunk_id = chunk_header[:4]
+            chunk_size = int.from_bytes(chunk_header[4:8], "little", signed=False)
+            if chunk_id == b"data":
+                return f.tell(), chunk_size
+            # Skip this chunk (round up to even byte alignment per RIFF spec).
+            f.seek(chunk_size + (chunk_size & 1), 1)
 
 
 def _pick_video_encoder() -> tuple[list[str], str]:
