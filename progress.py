@@ -21,22 +21,23 @@ from tqdm import tqdm
 
 
 # Baseline timings on the dev machine (GTX 1660 Ti, batched int8_float16
-# transcribe, h264_nvenc p1 encode). All in seconds.
+# transcribe, smartcut+h264_nvenc encode). Calibrated from a 1h25 H.264 run:
+# total wall-clock 137.5s on cached download (1h25 source → 34min output).
 #   ("constant", X)  → flat X seconds regardless of source duration
 #   ("source",   X)  → X * source_duration_seconds
-#   ("output",   X)  → X * estimated_output_duration  (output ≈ 0.3 × source)
+#   ("output",   X)  → X * estimated_output_duration  (output ≈ 0.4 × source)
 _BASELINES = {
     "download":   ("constant", 30.0),
-    "transcribe": ("source",   0.012),  # ~80x realtime on batched GPU
-    "loudness":   ("source",   0.003),  # plus ~3s ffmpeg extract overhead
+    "transcribe": ("source",   0.015),  # ~67x realtime on batched GPU (77s/5155s)
+    "loudness":   ("source",   0.002),  # ~500x realtime (11s/5155s incl. ffmpeg extract)
     "llm":        ("constant", 35.0),
     "post":       ("constant", 1.0),    # snap + trim (instant)
-    # encode: rough source-based estimate. Smartcut path encodes at ~0.07x
-    # of output duration on H.264 (stream-copies most of it); full-reencode
-    # fallback is ~0.20x. Pipeline calls set_stage_baseline() once snap+trim
-    # finishes with a refined value (output_dur × 0.08), and observed-rate
-    # reports from the cutter further refine it during encoding.
-    "encode":     ("source",   0.025),
+    # encode (smartcut+nvenc on H.264): ~0.020x of OUTPUT duration. Before
+    # we know the output, estimate as 0.010 × source (assuming ~50% kept).
+    # Pipeline calls set_stage_baseline() once snap+trim finishes with the
+    # exact output_dur × 0.025. Observed-rate from the cutter further
+    # refines mid-encode (pushes up for AV1 fallback path, etc).
+    "encode":     ("source",   0.010),
 }
 
 _TRACKER = None  # module-level singleton; pipeline initialises, stages call.

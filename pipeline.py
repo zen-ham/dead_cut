@@ -239,11 +239,10 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
         print("[pipeline] DRY RUN — skipping ffmpeg cut")
     else:
         # Refine the encode baseline now that we know exact output duration.
-        # ~0.08x of output for the smartcut+nvenc path (which is what runs on
-        # H.264 sources by default). Full-reencode fallback is ~0.20x but
-        # observed-rate reports from cutter will push the estimate up live
-        # if it ends up running.
-        progress.set_stage_baseline("encode", keep_secs * 0.08)
+        # ~0.020x of output for smartcut+nvenc (the default H.264 path).
+        # Full-reencode fallback is ~0.10x; observed-rate reports from
+        # cutter push the estimate up live if that path runs.
+        progress.set_stage_baseline("encode", keep_secs * 0.025)
         progress.begin_stage("encode")
         cut_video(video_path, keeps, final_path, work_dir=out_dir)
         progress.end_stage("encode")

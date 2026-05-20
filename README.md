@@ -19,10 +19,17 @@ The raw LLM cut ranges then go through two post-processing stages that nobody to
 
 Final output is built with [`smartcut`](https://github.com/skeskinen/smartcut) (PyAV-based partial-reencode lib) with `h264_nvenc` monkey-patched in for the boundary GOPs — every cut splits exactly one or two GOPs around it, those get decoded and re-encoded on the GPU, every other GOP is stream-copied at the bitstream level. Audio is opus passthru'd from source, no re-encode at all. The full-reencode `select`-filter path still lives in `cutter.py` as a fallback (used automatically if smartcut errors, or for non-h264 sources like AV1). Benchmarked at ~2.1x faster than the old full-reencode pipeline on a 45min 720p60 h264 source with 221 cuts (49s vs 102s on a GTX 1660 Ti). Sample-precise output duration regardless of cut count — no keyframe drift across hundreds of micro-cuts (which is what kills the naive stream-copy approach that I tried first; 221 stream-copy cuts on the test vod accumulated ~10 minutes of drift before I caught it).
 
-Speed on a GTX 1660 Ti:
-- 27-min vod → ~4 min total
-- 45-min vod → ~9 min total
-- 3-hour vod → ~24 min total
+Speed on a GTX 1660 Ti (the whole pipeline runs at ~30-50x realtime on
+H.264 sources thanks to batched whisper + smartcut). Measured on cached
+download:
+
+- 27-min vod  → ~50s total
+- 45-min vod  → ~1m 30s total
+- 1h25 vod    → ~2m 17s total (real bench)
+- 3-hour vod  → ~5m total
+
+Add the actual download time on a cold cache (varies with your connection
+— maybe +1-3 min for a typical 30min-3hr 720p H.264 video).
 
 Usage:
 -
