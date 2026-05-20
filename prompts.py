@@ -37,10 +37,18 @@ YOUR OUTPUT MUST HAVE FOUR BLOCKS IN THIS EXACT ORDER:
   HIGHLIGHTS_END
 
   CANDIDATES_BEGIN
-  HH:MM:SS-HH:MM:SS
-  HH:MM:SS-HH:MM:SS
-  (your first-pass candidate cut ranges; one per line)
+  HH:MM:SS-HH:MM:SS — short reason (quote a boring transcript line, or note "dead air L=0.0", "tutorial readout", "repeated 'alrights'", etc)
+  HH:MM:SS-HH:MM:SS — short reason
+  (list each candidate with a SPECIFIC reason on the same line — separated by " — ")
   CANDIDATES_END
+
+  CRITICAL: CANDIDATES is a list of SPECIFIC boring ranges you identified \
+in the transcript. It is NOT a partition of the runtime. If you find yourself \
+emitting contiguous ranges that cover the whole video (range1 end == range2 \
+start, etc.), you are CHUNKING, not analyzing — stop and re-read the \
+transcript for actual boring sections. Each candidate must have a concrete \
+reason you can point to. Aim for 10-50 distinct boring sections totaling \
+30-60% of the runtime, not 60+ adjacent blocks totaling 100%.
 
   AUDIT_BEGIN
   Now sum your draft cuts and check the budget. Show the math:
