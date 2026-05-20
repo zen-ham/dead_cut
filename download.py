@@ -143,8 +143,12 @@ def download(url: str, video_id: str) -> str:
             if dl_bar[0] is not None:
                 if total and dl_bar[0].total != total:
                     dl_bar[0].total = total
-                dl_bar[0].n = d.get("downloaded_bytes", 0)
+                downloaded = d.get("downloaded_bytes", 0)
+                dl_bar[0].n = downloaded
                 dl_bar[0].refresh()
+                # Report observed download pace for overall ETA.
+                if total and downloaded > 0:
+                    progress.report_stage_rate("download", downloaded / total)
                 progress.tick()
         elif st == "finished":
             if dl_bar[0] is not None:

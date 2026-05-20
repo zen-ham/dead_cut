@@ -173,7 +173,8 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
     keep_secs_pre = sum(e - s for s, e in keeps_pre_trim)
     pct_cut = 100.0 * cut_secs / max(duration, 1e-6)
     print(f"[pipeline] {len(cuts)} cuts totalling {cut_secs:.1f}s ({pct_cut:.1f}% of {duration:.1f}s)")
-    print(f"[pipeline] keeping {keep_secs_pre:.1f}s in {len(keeps_pre_trim)} segments (pre-trim)")
+    print(f"[pipeline] expected length after AI cuts: {_hms(keep_secs_pre)} "
+          f"(was {_hms(duration)}, {100*keep_secs_pre/duration:.1f}% kept)")
 
     # 5b. Within-keep silence trim. The LLM sees segment-level loudness summary
     # so it can't catch the 15s walking-around silences between two spoken
@@ -192,6 +193,9 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
         if trim:
             print("[pipeline] trim enabled but no silences in loudness cache — skipped")
     keep_secs = sum(e - s for s, e in keeps)
+    if trim and keep_secs != keep_secs_pre:
+        print(f"[pipeline] expected length after silence trim: {_hms(keep_secs)} "
+              f"(was {_hms(duration)}, {100*keep_secs/duration:.1f}% kept)")
     progress.end_stage("post")
 
     # 6. Cut. Per-iter file for debugging; also copy to final.mp4 as the
@@ -200,6 +204,11 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
     if dry_run:
         print("[pipeline] DRY RUN — skipping ffmpeg cut")
     else:
+        # Refine the encode baseline now that we know exact output duration.
+        # Initial baseline used a 30% keep-fraction guess; here we have the
+        # real number, and a measured ~0.20x encode/output rate for nvenc p1
+        # on H.264 source.
+        progress.set_stage_baseline("encode", keep_secs * 0.20)
         progress.begin_stage("encode")
         cut_video(video_path, keeps, final_path, work_dir=out_dir)
         progress.end_stage("encode")

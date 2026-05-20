@@ -77,6 +77,8 @@ def transcribe(
         delta = max(0.0, s.end - prev_end)
         pbar.update(delta)
         prev_end = s.end
+        # Report observed transcribe pace for overall ETA.
+        progress.report_stage_rate("transcribe", s.end / max(info.duration, 1))
         progress.tick()
     # Snap to 100% in case the last segment ended slightly short of info.duration.
     pbar.n = pbar.total

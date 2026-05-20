@@ -217,6 +217,9 @@ def _run_ffmpeg_with_progress(cmd: list, total_keep_s: float, label: str) -> tup
             if cur_s > last:
                 pbar.update(cur_s - last)
                 last = cur_s
+                # Report observed encode rate so the overall bar uses our
+                # actual pace (not its baseline guess) for the encode stage.
+                progress.report_stage_rate("encode", cur_s / max(total_keep_s, 1))
                 progress.tick()
     pbar.n = pbar.total
     pbar.refresh()
