@@ -59,7 +59,7 @@ def _print_cut_stats(n_cuts: int, duration_s: float) -> None:
     elif n_cuts <= target_high:
         verdict = "ON TARGET"
     else:
-        verdict = "above target (aggressive)"
+        verdict = "above target (long cuts ok if specific)"
 
     print()
     print(f"  [ai cut stats]")
@@ -146,10 +146,10 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
     _print_cut_stats(len(cuts_raw), duration)
 
     # Final safety net: if the model + revision both failed to stay under the
-    # 65% budget, drop the longest cuts programmatically. This runs even when
+    # 75% budget, drop the longest cuts programmatically. This runs even when
     # detect_cuts already triggered a revision — that's intentional: it only
     # trims if STILL over budget after revision.
-    cuts_raw, was_trimmed = enforce_budget(cuts_raw, duration, ceiling_frac=0.65)
+    cuts_raw, was_trimmed = enforce_budget(cuts_raw, duration, ceiling_frac=0.75)
     if was_trimmed:
         new_total = sum(e - s for s, e in cuts_raw)
         new_pct = 100.0 * new_total / max(duration, 1e-6)

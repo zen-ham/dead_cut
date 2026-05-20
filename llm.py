@@ -120,7 +120,7 @@ def revise_cuts_over_budget(
     correction = (
         f"Your CUTS_BEGIN..CUTS_END block totals approximately "
         f"{cut_secs:.0f}s, which is {actual_cut_pct:.1f}% of the {duration_s:.0f}s "
-        f"video. That exceeds the 65% maximum — the response will be rejected.\n\n"
+        f"video. That exceeds the 75% maximum — the response will be rejected.\n\n"
         f"This usually happens when CANDIDATES became contiguous chunks of the "
         f"whole runtime (block-chunking) instead of specific boring sections. "
         f"To fix:\n\n"
@@ -155,10 +155,14 @@ def revise_cuts_over_budget(
 
 
 # Budget threshold for triggering a revision request. If the model's first-pass
-# CUTS exceed this fraction of source duration, ask it to reconsider.
-BUDGET_CEILING = 0.65
-# Target fraction we ask the revision to hit (leaves a buffer under the ceiling).
-REVISION_TARGET = 0.60
+# CUTS exceed this fraction of source duration, ask it to reconsider. Set at
+# 75% to give the model real freedom — only catches egregious over-cutting.
+BUDGET_CEILING = 0.75
+# When revision fires, ask the model to aim for a MODERATE cut (not just
+# barely-under-ceiling). The thinking: if it over-shot the 75% line, its
+# judgment for THIS vod was probably miscalibrated; pulling back to ~55%
+# protects against losing too much content to over-eager cutting.
+REVISION_TARGET = 0.55
 
 
 def detect_cuts(

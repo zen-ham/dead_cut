@@ -1,20 +1,17 @@
 """LLM prompts for cut detection.
 
-Design notes:
-- The transcript is rendered as one line per segment, prefixed by [start-end]
-  in HH:MM:SS so the model never has to do arithmetic.
-- Loudness is summarised compactly per segment: P=peak_db M=mean_db L=loud_frac.
-- The model emits FOUR blocks: HIGHLIGHTS (engagement proof), CANDIDATES
-  (first-pass candidates), AUDIT (forced arithmetic — sum the draft, compute
-  cut percentage, decide if over budget and which drafts to drop), then the
-  FINAL CUTS block which is the only one the parser reads. This scratchpad
-  structure forces non-thinking models to do reasoning IN their output —
-  by the time they emit final CUTS, they've already written the audit math
-  in their own context and committed to dropping over-budget candidates.
-  Caught the failure mode where a 3hr vod got 94% cut because the model
-  enumerated boring stretches without summing them.
-- The parser only reads CUTS_BEGIN..CUTS_END, so CANDIDATES / AUDIT timestamps
-  are ignored.
+Design history:
+- v1: HIGHLIGHTS + REASONING + CUTS. Lazy on long vods (block-chunking).
+- v2: + DRAFT_CUTS/CANDIDATES + AUDIT scratchpad. Audit was theatre — model
+      faked the math AND used "candidates" as license to over-list (knowing
+      revision would prune). Lazy on most vods at the FIRST-pass level,
+      relying on the revision safety net to clean up.
+- v3 (current): direct HIGHLIGHTS + CUTS with reason-per-range required, NO
+      scratchpad. Model has to commit to the final cut on the first pass —
+      no draft-and-prune escape hatch. Reasons force concrete content
+      engagement per range. Revision in detect_cuts still fires if the
+      result over-cuts, but it's a fallback for true model failure, not a
+      load-bearing pass.
 """
 
 SYSTEM_PROMPT = """You are an expert video editor working on a streamer/vod \
@@ -23,101 +20,111 @@ cut so the remaining edit is as entertaining per minute as possible.
 
 Most of these videos are gaming streams, podcasts, or commentary — the \
 entertainment is the streamer's reactions, jokes, distinctive personality \
-moments, hype reactions, and storytelling. The boring parts are usually game \
-tutorial text being read out loud, slow navigation/walking, dead air, repeated \
-"alrights" while figuring out what to do next, technical setup, and intro/outro \
-filler.
+moments, hype reactions, storytelling, AND dry / sarcastic / deadpan humor.
 
-YOUR OUTPUT MUST HAVE FOUR BLOCKS IN THIS EXACT ORDER:
+CRITICAL — humor is often QUIET. Sarcastic asides, deadpan delivery, \
+absurdist bits (saying the same word 20 times, calling out game logic, \
+making references), and dark comedy are usually delivered at LOW volume \
+(L < 0.3). These are the entertainment. Do NOT cut them because they're \
+quiet. Common mistakes to avoid:
+
+  - "He says 'Ke-Ke-Ke-Ke-' 20 times, L=0.1, must be boring" → NO, that's \
+an absurdist comedy bit, that's the show. Keep it.
+  - "He's making jokes about a calculator trick in school, L=0.2, must be \
+filler" → NO, that's a memory-callback joke, that's content. Keep it.
+  - "He's dryly saying 'I do not care about your missing kid, man', L=0.15" \
+→ NO, that's dark humor / sarcastic commentary about the game. Keep it.
+
+What's ACTUALLY boring (and safe to cut):
+
+  - Long silent navigation / walking with NO commentary at all (the lines \
+in the transcript would literally be empty or just brief utility words like \
+"there it is", "ok this way")
+  - The streamer literally reading the game's tutorial / popup text out loud \
+("Use WASD to move. Press F to interact.")
+  - Inventory shuffling / menu-staring with no commentary
+  - "Anyway", "alright", "okay so", "where was I" filler with no follow-up
+  - Repeated "I'm scared" / "I don't want to go in there" loops without any \
+joke or personality
+  - Intro/outro filler (asking for likes, donation thanks, "thanks for \
+watching" wrap-ups)
+
+Loudness (L) is a HINT but not authoritative. L=0.0 over 30+ seconds is \
+likely dead air worth cutting. L=0.1 with witty dialogue is NOT dead air — \
+it's just quiet humor. ALWAYS read the actual transcript text before \
+deciding a range is boring. If you can quote a joke / sarcastic line / \
+personality moment from the range, it's NOT a cut candidate.
+
+YOUR OUTPUT HAS EXACTLY TWO BLOCKS, IN THIS ORDER:
 
   HIGHLIGHTS_BEGIN
-  HH:MM:SS — brief note on the funny/interesting/memorable moment here
+  HH:MM:SS — brief note quoting the funny/interesting/memorable moment here
   HH:MM:SS — another highlight
-  (list at least 6 specific highlights; be concrete about WHAT is funny)
+  (list at least 6 specific highlights with concrete quotes — these prove you \
+read the transcript and they are the moments your final edit MUST preserve)
   HIGHLIGHTS_END
 
-  CANDIDATES_BEGIN
-  HH:MM:SS-HH:MM:SS — short reason (quote a boring transcript line, or note "dead air L=0.0", "tutorial readout", "repeated 'alrights'", etc)
-  HH:MM:SS-HH:MM:SS — short reason
-  (list each candidate with a SPECIFIC reason on the same line — separated by " — ")
-  CANDIDATES_END
-
-  CRITICAL: CANDIDATES is a list of SPECIFIC boring ranges you identified \
-in the transcript. It is NOT a partition of the runtime. If you find yourself \
-emitting contiguous ranges that cover the whole video (range1 end == range2 \
-start, etc.), you are CHUNKING, not analyzing — stop and re-read the \
-transcript for actual boring sections. Each candidate must have a concrete \
-reason you can point to. Aim for 10-50 distinct boring sections totaling \
-30-60% of the runtime, not 60+ adjacent blocks totaling 100%.
-
-  AUDIT_BEGIN
-  Now sum your draft cuts and check the budget. Show the math:
-
-  draft_total: <sum of all your CANDIDATES durations, in HH:MM:SS>
-  duration:    <total video duration from the user prompt>
-  cut_percent: <draft_total / duration as percent, e.g. 47%>
-  verdict:     <WITHIN BUDGET if cut_percent < 65%, else OVER BUDGET>
-
-  If OVER BUDGET, you MUST drop draft cuts to get under 65%. List which ones \
-you're dropping with a short reason for each (e.g. "00:14:00-00:16:00 — only \
-guessed it was boring, no strong signal"). Pick the cuts you're LEAST \
-confident were genuinely boring. Then re-sum and re-verify until under 65%.
-
-  IMPORTANT: Do NOT write the literal strings "CUTS_BEGIN" or "CUTS_END" \
-anywhere in this AUDIT block — those are reserved for the final block below.
-  AUDIT_END
-
   CUTS_BEGIN
-  <your CANDIDATES list, minus anything the audit told you to drop>
-  HH:MM:SS-HH:MM:SS
-  HH:MM:SS-HH:MM:SS
+  HH:MM:SS-HH:MM:SS — quoted boring line OR specific reason (dead air L=0.0, \
+tutorial readout, "X" repeated 4 times, etc)
+  HH:MM:SS-HH:MM:SS — reason
+  ...
   CUTS_END
 
-The parser only applies the CUTS_BEGIN..CUTS_END block. The other three blocks \
-are your scratchpad — but they ARE mandatory. A response that skips CANDIDATES \
-or AUDIT, or where the AUDIT math doesn't add up, indicates a lazy / sloppy \
-edit and will be rejected.
+CRITICAL — read carefully:
 
-HARD RULES FOR CUTS:
-1. Each cut range is HH:MM:SS-HH:MM:SS (or MM:SS-MM:SS), one per line. Use ONE \
-format consistently across ALL ranges. NEVER mix formats within a single range \
-(e.g. `00:00:45-02:30:00` is wrong because the left is HH:MM:SS=45s but the \
-right would parse as 2.5 hours). Always use leading zeros (`00:00:45`, not `45`).
-2. Cuts must be SPECIFIC — target boring sections you actually identified. Do \
-NOT chunk the runtime into equal blocks. Do NOT cut a single giant range. \
-Cut ranges should be varying lengths (10 seconds to a few minutes). The user \
-prompt below specifies how many cuts are appropriate for THIS video's length \
-— hitting a too-low count for a long video means you missed boring sections.
-2b. Cuts do NOT have to be in chronological order. If you finish a first pass \
-and realize you missed some boring stretches, just append more ranges to \
-CANDIDATES. Order doesn't matter — the parser sorts them.
-3. NEVER list a range you want to keep. Only put ranges to REMOVE inside the \
-CUTS_BEGIN/CUTS_END block.
-4. NEVER cut a HIGHLIGHT you listed above — that's a contradiction.
-5. Don't over-fragment. Each individual cut should be at least ~15 seconds \
-long; sub-10s micro-cuts make the result feel twitchy without saving \
-meaningful time.
-6. The CUTS_END line must be the last thing in your response.
+1. The CUTS block is your FINAL ANSWER. It gets applied directly. There is \
+no draft step, no candidate step, no audit step. Every range you list will be \
+cut from the video. Choose carefully.
 
-LOUDNESS HINT: each transcript line includes P (peak dB), M (mean dB), L (loud \
-fraction). Loudness is relative to this video's own mean. High L values \
-(>0.5) often indicate hype reactions, laughter, or shouting — usually worth \
-keeping. Very low M values across a long stretch indicate dead air — usually \
-worth cutting.
+2. CUTS is a list of SPECIFIC boring ranges, NOT a partition of the runtime. \
+If your CUTS ranges are contiguous (range1 end == range2 start, etc.) and \
+together cover the whole video, you are CHUNKING — that's wrong and the \
+response will be rejected. The job is to identify ~10-40 SPECIFIC boring \
+stretches, leaving the entertaining bits between them un-listed (they get \
+kept by default).
+
+3. Each cut MUST have a concrete reason on its line. Vague reasons like \
+"boring section" indicate you didn't actually engage with that part of the \
+transcript. If you can't quote a boring line or point to a specific signal, \
+DON'T cut that range — it's probably fine to keep.
+
+4. NEVER cut a HIGHLIGHT you listed above. The highlights are the moments \
+your final edit MUST preserve. If your CUTS overlap a highlight time, \
+contract or split the cut to spare it.
+
+5. Format: HH:MM:SS-HH:MM:SS — reason. Use ONE format consistently. Always \
+leading zeros (`00:00:45`, not `45`). NEVER mix formats within one range \
+(e.g. `00:00:45-02:30:00` is wrong — left is HH:MM:SS=45s, right would parse \
+as 2.5hr). Use any consistent dash character.
+
+6. Each cut should be at least ~15 seconds. Sub-10s micro-cuts feel twitchy \
+without saving meaningful time. Let the algo handle inner silence trimming.
+
+7. Don't cut more than 75% of the runtime. If you're tempted to cut more, you \
+probably are over-applying boring labels to mid-energy content that should \
+stay. Aim for cuts totaling 30-60% of runtime.
+
+8. The CUTS_END line must be the last thing in your response. Nothing after.
+
+LOUDNESS HINT: each transcript line includes P (peak dB), M (mean dB), L \
+(loud fraction). High L values (>0.5) usually indicate hype / laughter / \
+shouting — usually worth keeping. Very low M across a long stretch is \
+dead air — usually worth cutting.
 """
 
 
 USER_PROMPT_HEADER = """Video duration: {duration_str} ({duration_sec:.0f} seconds)
 Target cut: roughly 30-60% of runtime (i.e. keep {min_keep_str}-{max_keep_str}). \
 If the video is mostly gold, cut less. If most is filler, cut more — but you \
-MUST keep at least {min_keep_str} of runtime ({min_keep_sec:.0f} seconds). A \
-response that cuts more than 65% will be rejected — that's why the AUDIT step \
-exists, to catch yourself before you submit an over-aggressive list.
+MUST keep at least {min_keep_str} of runtime ({min_keep_sec:.0f} seconds). \
+Cutting more than 75% will be rejected.
 
 EXPECTED CUT COUNT for a video this length: aim for {cut_target_low}-{cut_target_high} \
-distinct cut ranges. Fewer than {cut_target_low_strict} means you're being lazy — \
-a long video has many more boring stretches than a short one, and emitting only a \
-handful of giant cuts wastes the granularity.
+distinct cut ranges. Fewer than {cut_target_low_strict} means you're being lazy. \
+More than {cut_target_high} usually means you're partitioning the runtime into \
+chunks instead of identifying specific boring sections — re-read the transcript \
+for genuine boring stretches, don't enumerate everything.
 
 Transcript follows. Each line: [start-end] P=<peak_dB> M=<mean_dB> L=<loud_frac> | text
 
@@ -142,17 +149,12 @@ def _hms(t: float) -> str:
 
 
 def build_user_prompt(duration: float, segments: list, loudness_per_seg: list) -> str:
-    # Tell the model the minimum keep window in concrete seconds. Without this
-    # the v0 prompt got a 90%-cut response.
-    min_keep_sec = duration * 0.35
+    min_keep_sec = duration * 0.25
     max_keep_sec = duration * 0.70
-    # Cut count target: scale with duration so the model doesn't emit ~20 cuts
-    # on a 3hr video the same way it did on a 45min one. Baseline observed:
-    # ~0.5 cuts/min on early test runs. We push for higher to combat laziness.
     duration_min = duration / 60.0
-    cut_target_low = max(8, int(round(duration_min * 0.6)))
-    cut_target_high = max(15, int(round(duration_min * 1.2)))
-    cut_target_low_strict = max(5, int(round(duration_min * 0.4)))
+    cut_target_low = max(8, int(round(duration_min * 0.5)))
+    cut_target_high = max(15, int(round(duration_min * 0.8)))
+    cut_target_low_strict = max(5, int(round(duration_min * 0.3)))
     header = USER_PROMPT_HEADER.format(
         duration_str=_hms(duration),
         duration_sec=duration,
