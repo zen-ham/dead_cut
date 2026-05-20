@@ -101,12 +101,69 @@ def _cut_streamcopy(
     print(f"[cutter] stream-copy: wrote {output_path} ({len(seg_paths)} segments, {total_keep:.1f}s kept)")
 
 
+def _get_source_frame_rate(source_path: str) -> float | None:
+    """Probe the source's video stream r_frame_rate. Returns fps as a float
+    (e.g. 60.0, 29.97), or None on failure."""
+    try:
+        r = subprocess.run([
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate",
+            "-of", "default=noprint_wrappers=1:nokey=1", source_path,
+        ], capture_output=True, text=True, timeout=10)
+        out = (r.stdout or "").strip()
+        if "/" in out:
+            num, den = out.split("/")
+            return int(num) / int(den)
+        return float(out)
+    except Exception:
+        return None
+
+
+def _snap_ranges_to_frames(
+    ranges: List[Tuple[float, float]], fr: float,
+) -> List[Tuple[float, float]]:
+    """Snap each range's start AND end to the nearest video-frame boundary.
+    This is the fix for the audio/video drift bug:
+
+    Audio Python-splice gives EXACTLY (end - start) seconds per range
+    (sample-accurate). Video ffmpeg-select with setpts=N/FRAME_RATE/TB gives
+    N/FR seconds where N is the number of frames whose source PTS falls in
+    [s, e). Per-range duration mismatch is ~1/FR (16.67ms at 60fps). Over
+    600+ ranges this accumulates to multi-second drift.
+
+    Snapping both s and e to k/FR boundaries means audio and video share
+    the SAME range timings — both produce (L-K)/FR seconds where L=round(e*fr)
+    and K=round(s*fr). Zero accumulated drift.
+    """
+    out = []
+    for s, e in ranges:
+        s_snap = round(s * fr) / fr
+        e_snap = round(e * fr) / fr
+        if e_snap > s_snap:
+            out.append((s_snap, e_snap))
+    return out
+
+
 def _build_video_filter_script(keep_ranges: List[Tuple[float, float]]) -> str:
-    """Video-only filter: single select with between() expression OR'd via +.
-    Audio is pre-spliced in Python (see _splice_audio) and muxed as a second
-    input — way faster than 600+ atrim+concat filters on the audio side which
-    bottleneck ffmpeg's filter scheduler and freeze the pipeline."""
-    video_expr = "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in keep_ranges)
+    """Video-only filter: single select with per-range gte*lt predicates OR'd
+    via +. Audio is pre-spliced in Python (see _splice_audio) and muxed as a
+    second input — way faster than 600+ atrim+concat filters which bottleneck
+    ffmpeg's filter scheduler.
+
+    Why gte*lt instead of between(): ffmpeg's between(x, min, max) is
+    INCLUSIVE on both ends. With ranges snapped to frame boundaries [K/fr, L/fr],
+    between() would keep frames at K, K+1, ..., L-1, AND L — that's L-K+1
+    frames, one more than expected. Python audio splice uses [start, stop) =
+    L-K samples worth of audio. Result: video is 1 frame longer than audio
+    per range, accumulating to multi-second drift across hundreds of ranges.
+
+    gte(t,s)*lt(t,e) is inclusive-start, exclusive-end — matches Python's
+    [start, stop) and gives the same frame count as audio sample count.
+    Use 6 decimal places to avoid float-comparison fuzziness on frame
+    boundaries that need to be exact (snap_ranges_to_frames produces these).
+    """
+    parts = [f"gte(t,{s:.6f})*lt(t,{e:.6f})" for s, e in keep_ranges]
+    video_expr = "+".join(parts)
     return f"[0:v]select='{video_expr}',setpts=N/FRAME_RATE/TB[outv]"
 
 
@@ -242,10 +299,21 @@ def _cut_reencode(
 
     Stream-copy isn't usable here because keyframe-snap drift compounds
     across hundreds of micro-cuts."""
-    # 1. Pre-splice audio in Python.
+    # FIX A/V DRIFT: snap each range's boundaries to the source's frame
+    # timeline before splicing. Without this, audio is sample-accurate but
+    # video rounds to whole frames → per-range mismatch of ~1/fps seconds
+    # accumulates across hundreds of cuts into multi-second drift. With
+    # snapping, audio and video share the SAME boundaries → zero drift.
+    fr = _get_source_frame_rate(source_path)
+    if fr and fr > 0:
+        keep_ranges = _snap_ranges_to_frames(keep_ranges, fr)
+        print(f"[cutter] snapped {len(keep_ranges)} ranges to {fr:.3f}fps frame boundaries (A/V sync)")
+
+    # 1. Pre-splice audio in Python — using the SNAPPED ranges so audio
+    # boundaries match video boundaries exactly.
     spliced_audio = _splice_audio(source_path, keep_ranges, work_dir)
 
-    # 2. Build the (now small) video-only filter script.
+    # 2. Build the (now small) video-only filter script — also using snapped.
     filter_script = _build_video_filter_script(keep_ranges)
     script_path = os.path.join(work_dir, "filter_complex.txt")
     with open(script_path, "w", encoding="utf-8") as f:
