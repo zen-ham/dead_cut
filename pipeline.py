@@ -212,8 +212,17 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
         progress.begin_stage("encode")
         cut_video(video_path, keeps, final_path, work_dir=out_dir)
         progress.end_stage("encode")
-        import shutil
-        shutil.copyfile(final_path, os.path.join(out_dir, "final.mp4"))
+        # Hard-link `final.mp4` -> `final_iter{N}.mp4` instead of copying.
+        # Same inode, no extra disk. Deleting either leaves the other intact.
+        # Falls back to copy if hardlinks aren't supported (cross-fs etc).
+        canonical = os.path.join(out_dir, "final.mp4")
+        if os.path.exists(canonical):
+            os.remove(canonical)
+        try:
+            os.link(final_path, canonical)
+        except OSError:
+            import shutil
+            shutil.copyfile(final_path, canonical)
 
     progress.close()
 

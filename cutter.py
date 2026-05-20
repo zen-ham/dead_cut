@@ -190,99 +190,119 @@ def _splice_audio(
     """
     sr = 48000
     channels = 2
-    full_wav = os.path.join(work_dir, "cutter_audio_full.wav")
+    sample_bytes = channels * 2  # int16 stereo = 4 bytes per sample-frame
     out_wav = os.path.join(work_dir, "cutter_audio_spliced.wav")
 
-    # 1. Decode source AUDIO ONLY to a clean wav we can random-access.
-    # `-map 0:a:0` selects just the first audio stream — the demuxer skips
-    # the video packets entirely (vs `-vn` which discards-after-decoding).
-    if not os.path.exists(full_wav) or os.path.getsize(full_wav) == 0:
-        # Source duration for the progress bar.
-        try:
-            r = subprocess.run([
-                "ffprobe", "-v", "error", "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1", source_path,
-            ], capture_output=True, text=True, timeout=10)
-            src_dur = float((r.stdout or "0").strip())
-        except Exception:
-            src_dur = 0.0
-        print(f"[cutter] extracting source audio -> wav...")
-        cmd = [
-            "ffmpeg", "-y", "-i", source_path,
-            "-map", "0:a:0",
-            "-c:a", "pcm_s16le",
-            "-ar", str(sr),
-            "-ac", str(channels),
-            "-threads", "0",
-            full_wav,
-        ]
-        rc, stderr_tail = _run_ffmpeg_with_progress(
-            cmd, max(src_dur, 1.0), "[cutter] audio extract",
-        )
-        if rc != 0:
-            raise RuntimeError(f"audio extract failed:\n{stderr_tail[-1500:]}")
+    # STREAMING APPROACH: pipe ffmpeg's raw PCM output straight into Python.
+    # No multi-GB intermediate file on disk. ffmpeg decodes opus → stdout
+    # → Python skips/copies bytes per keep range → writes spliced wav.
+    #
+    # Why this replaces the previous "extract to disk, then seek+read":
+    #   1. Eliminates the 2GB+ intermediate (saves disk + I/O).
+    #   2. Sidesteps every WAV/libsndfile size-limit gotcha encountered so
+    #      far (2GB truncation in ffmpeg's WAV writer, libsndfile's
+    #      psf_fseek bug past ~1.4GB on Windows).
+    #   3. ffmpeg's stdout pipe is sequential, which matches our ranges:
+    #      we sort ranges, read+discard between them, read+keep within them.
+    try:
+        r = subprocess.run([
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", source_path,
+        ], capture_output=True, text=True, timeout=10)
+        src_dur = float((r.stdout or "0").strip())
+    except Exception:
+        src_dur = 0.0
 
-    # 2. Splice in Python. Read source wav via raw byte I/O — libsndfile's
-    # seek breaks on Windows once you're >~1.4GB into a wav file (internal
-    # 32-bit-signed offset overflow), and the standard PCM WAV layout is
-    # trivial to parse manually: header (data offset), then samples laid out
-    # contiguously. Output wav is written via soundfile (no seeking on the
-    # output side, just sequential writes — that's fine).
-    info = sf.info(full_wav)
-    real_sr = info.samplerate
-    real_ch = info.channels
-    sample_bytes = real_ch * 2  # int16 = 2 bytes per channel sample
-    data_offset, _ = _wav_data_chunk(full_wav)
-    total_samples = sum(int(round((e - s) * real_sr)) for s, e in keep_ranges)
-    print(f"[cutter] splicing {len(keep_ranges)} audio segments "
-          f"({total_samples/real_sr:.1f}s output) in Python...")
+    sorted_ranges = sorted([(max(0.0, s), max(s, e)) for s, e in keep_ranges])
+    total_out_s = sum(e - s for s, e in sorted_ranges)
+    print(f"[cutter] streaming + splicing audio: {len(sorted_ranges)} segments, "
+          f"{total_out_s:.1f}s output (no intermediate file)...")
+
+    cmd = [
+        "ffmpeg", "-y", "-i", source_path,
+        "-map", "0:a:0",
+        "-f", "s16le",
+        "-acodec", "pcm_s16le",
+        "-ar", str(sr),
+        "-ac", str(channels),
+        "-threads", "0",
+        "-",  # pipe to stdout
+    ]
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        bufsize=8 * 1024 * 1024,  # 8MB pipe buffer
+    )
+    # Drain stderr in a thread so ffmpeg doesn't block on full stderr buffer.
+    stderr_chunks = []
+    def _drain_err():
+        for line in proc.stderr:
+            stderr_chunks.append(line)
+            if sum(len(s) for s in stderr_chunks) > 8000:
+                stderr_chunks.pop(0)
+    drain = threading.Thread(target=_drain_err, daemon=True)
+    drain.start()
+
     pbar = tqdm(
-        total=len(keep_ranges), unit="seg", desc="[stage   ] audio splice",
+        total=len(sorted_ranges), unit="seg", desc="[stage   ] audio extract+splice",
         bar_format="{desc} {bar} {percentage:3.0f}% | {n}/{total} segs | eta {remaining}",
         position=1, leave=False,
     )
-    with open(full_wav, "rb") as f_in, \
-         sf.SoundFile(out_wav, mode="w", samplerate=real_sr,
-                      channels=real_ch, subtype="PCM_16") as f_out:
-        for s, e in keep_ranges:
-            start_sample = max(0, int(round(s * real_sr)))
-            end_sample = max(start_sample, int(round(e * real_sr)))
-            if end_sample <= start_sample:
+
+    READ_CHUNK = 4 * 1024 * 1024  # 4MB reads from pipe
+    samples_consumed = 0  # how many SAMPLES we've pulled from ffmpeg stdout
+
+    def _read_exact(n: int) -> bytes:
+        """Read exactly n bytes from ffmpeg stdout (or until EOF). Bytes-only."""
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = proc.stdout.read(min(n - len(buf), READ_CHUNK))
+            if not chunk:
+                break
+            buf.extend(chunk)
+        return bytes(buf)
+
+    try:
+        with sf.SoundFile(out_wav, mode="w", samplerate=sr,
+                          channels=channels, subtype="PCM_16") as f_out:
+            for s, e in sorted_ranges:
+                start_sample = int(round(s * sr))
+                end_sample = int(round(e * sr))
+                if end_sample <= start_sample:
+                    pbar.update(1)
+                    continue
+                # Skip from current position up to start_sample (discard bytes).
+                if start_sample > samples_consumed:
+                    skip_bytes = (start_sample - samples_consumed) * sample_bytes
+                    while skip_bytes > 0:
+                        chunk = proc.stdout.read(min(skip_bytes, READ_CHUNK))
+                        if not chunk:
+                            break
+                        skip_bytes -= len(chunk)
+                    samples_consumed = start_sample
+                # Read the range's worth of audio (keep).
+                n_samples = end_sample - start_sample
+                buf = _read_exact(n_samples * sample_bytes)
+                if buf:
+                    arr = np.frombuffer(buf, dtype=np.int16).reshape(-1, channels)
+                    f_out.write(arr)
+                samples_consumed = end_sample
                 pbar.update(1)
-                continue
-            byte_offset = data_offset + start_sample * sample_bytes
-            byte_count = (end_sample - start_sample) * sample_bytes
-            f_in.seek(byte_offset)
-            buf = f_in.read(byte_count)
-            arr = np.frombuffer(buf, dtype=np.int16).reshape(-1, real_ch)
-            f_out.write(arr)
-            pbar.update(1)
-            progress.tick()
-    pbar.close()
+                progress.tick()
+            # Drain any remaining ffmpeg output so it can exit cleanly.
+            while True:
+                chunk = proc.stdout.read(READ_CHUNK)
+                if not chunk:
+                    break
+    finally:
+        pbar.close()
+        proc.stdout.close()
+        proc.wait(timeout=10)
+        drain.join(timeout=2)
+
+    if proc.returncode != 0:
+        tail = b"".join(stderr_chunks).decode("utf-8", errors="replace")[-1500:]
+        raise RuntimeError(f"ffmpeg audio decode failed (rc={proc.returncode}):\n{tail}")
     return out_wav
-
-
-def _wav_data_chunk(wav_path: str) -> tuple[int, int]:
-    """Parse a standard PCM WAV header and return (data_offset, data_size).
-
-    Standard layout: 'RIFF' + 4-byte file size + 'WAVE', followed by a series
-    of chunks each with 4-byte ID + 4-byte size + payload. We walk chunks
-    until we find 'data' and return its payload offset + size.
-    """
-    with open(wav_path, "rb") as f:
-        riff = f.read(12)
-        if riff[:4] != b"RIFF" or riff[8:12] != b"WAVE":
-            raise RuntimeError(f"not a WAV file: {wav_path}")
-        while True:
-            chunk_header = f.read(8)
-            if len(chunk_header) < 8:
-                raise RuntimeError(f"no 'data' chunk in {wav_path}")
-            chunk_id = chunk_header[:4]
-            chunk_size = int.from_bytes(chunk_header[4:8], "little", signed=False)
-            if chunk_id == b"data":
-                return f.tell(), chunk_size
-            # Skip this chunk (round up to even byte alignment per RIFF spec).
-            f.seek(chunk_size + (chunk_size & 1), 1)
 
 
 def _pick_video_encoder() -> tuple[list[str], str]:
