@@ -193,18 +193,34 @@ def _splice_audio(
     full_wav = os.path.join(work_dir, "cutter_audio_full.wav")
     out_wav = os.path.join(work_dir, "cutter_audio_spliced.wav")
 
-    # 1. Decode source to a clean wav we can random-access.
+    # 1. Decode source AUDIO ONLY to a clean wav we can random-access.
+    # `-map 0:a:0` selects just the first audio stream — the demuxer skips
+    # the video packets entirely (vs `-vn` which discards-after-decoding).
     if not os.path.exists(full_wav) or os.path.getsize(full_wav) == 0:
+        # Source duration for the progress bar.
+        try:
+            r = subprocess.run([
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", source_path,
+            ], capture_output=True, text=True, timeout=10)
+            src_dur = float((r.stdout or "0").strip())
+        except Exception:
+            src_dur = 0.0
         print(f"[cutter] extracting source audio -> wav...")
         cmd = [
             "ffmpeg", "-y", "-i", source_path,
-            "-vn",
+            "-map", "0:a:0",
             "-c:a", "pcm_s16le",
             "-ar", str(sr),
             "-ac", str(channels),
+            "-threads", "0",
             full_wav,
         ]
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        rc, stderr_tail = _run_ffmpeg_with_progress(
+            cmd, max(src_dur, 1.0), "[cutter] audio extract",
+        )
+        if rc != 0:
+            raise RuntimeError(f"audio extract failed:\n{stderr_tail[-1500:]}")
 
     # 2. Splice in Python via soundfile's seek-based reads.
     info = sf.info(full_wav)
@@ -213,16 +229,29 @@ def _splice_audio(
     total_samples = sum(int(round((e - s) * real_sr)) for s, e in keep_ranges)
     print(f"[cutter] splicing {len(keep_ranges)} audio segments "
           f"({total_samples/real_sr:.1f}s output) in Python...")
-    with sf.SoundFile(out_wav, mode="w", samplerate=real_sr,
+    # Keep the source wav open across all reads — avoids reopening the 2GB+
+    # file 600+ times and is meaningfully faster than the sf.read(path)-per-range
+    # form which closes and reopens between each read.
+    pbar = tqdm(
+        total=len(keep_ranges), unit="seg", desc="[stage   ] audio splice",
+        bar_format="{desc} {bar} {percentage:3.0f}% | {n}/{total} segs | eta {remaining}",
+        position=1, leave=False,
+    )
+    with sf.SoundFile(full_wav, mode="r") as f_in, \
+         sf.SoundFile(out_wav, mode="w", samplerate=real_sr,
                       channels=real_ch, subtype="PCM_16") as f_out:
         for s, e in keep_ranges:
             start_sample = max(0, int(round(s * real_sr)))
             end_sample = max(start_sample, int(round(e * real_sr)))
             if end_sample <= start_sample:
+                pbar.update(1)
                 continue
-            chunk, _ = sf.read(full_wav, start=start_sample, stop=end_sample,
-                               dtype="int16", always_2d=True)
+            f_in.seek(start_sample)
+            chunk = f_in.read(end_sample - start_sample, dtype="int16", always_2d=True)
             f_out.write(chunk)
+            pbar.update(1)
+            progress.tick()
+    pbar.close()
     return out_wav
 
 
