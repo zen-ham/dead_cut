@@ -8,7 +8,11 @@ from .download import download, fetch_duration
 from .transcribe import transcribe
 from .loudness import analyze as analyze_loudness
 from .llm import detect_cuts
-from .parser import parse_cuts, cuts_to_keeps, snap_cuts_to_silence, trim_silences_within_keeps, enforce_budget, extract_highlights_from_response, protect_highlights
+from .parser import (
+    parse_cuts, cuts_to_keeps, snap_cuts_to_silence, trim_silences_within_keeps,
+    enforce_budget, extract_highlights_from_response, protect_highlights,
+    merge_close_cuts,
+)
 from .cutter import cut_video
 from . import progress
 
@@ -144,15 +148,32 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
     # Protect highlights programmatically: the model commits to a HIGHLIGHTS
     # list (entertaining moments to keep) but empirically can contradict it
     # in CUTS (especially after an under-floor revision asks for more cuts).
-    # Parse the highlights from the PRIMARY response — revised responses are
-    # cut-only with no HIGHLIGHTS block.
+    # 3s padding (was 10s) is enough to preserve a one-line joke without
+    # forcing long uncut sections around each highlight.
     highlights = extract_highlights_from_response(primary_raw)
     if highlights:
         before_n = len(cuts_raw)
-        cuts_raw = protect_highlights(cuts_raw, highlights, padding_s=10.0)
+        cuts_raw = protect_highlights(cuts_raw, highlights, padding_s=3.0)
         if len(cuts_raw) != before_n:
             print(f"[pipeline] protect_highlights split {before_n} cuts into "
-                  f"{len(cuts_raw)} to preserve {len(highlights)} highlights")
+                  f"{len(cuts_raw)} to preserve {len(highlights)} highlights "
+                  f"(3s window each)")
+
+    # Merge cuts that have a small gap that's TRULY silent. The model often
+    # emits adjacent cuts with 1-5s gaps — some are intentional (a quick
+    # quip / reaction), some are accidental (dead air between two boring
+    # stretches the model labeled as separate). We only merge when the gap
+    # falls inside a detected silence (no speech, no highlight) — otherwise
+    # we'd swallow real content.
+    before_n = len(cuts_raw)
+    cuts_raw = merge_close_cuts(
+        cuts_raw, max_gap_s=5.0,
+        silences=loud.get("silences"),
+        highlights=highlights,
+    )
+    if len(cuts_raw) != before_n:
+        print(f"[pipeline] merged {before_n - len(cuts_raw)} adjacent cuts "
+              f"(gap <5s, fully silent, no highlight)")
 
     # Show the AI's cut decision IMMEDIATELY — user can see whether the model
     # engaged or was lazy before waiting on snap/trim/encode.

@@ -198,6 +198,59 @@ def trim_silences_within_keeps(
     return new_keeps
 
 
+def merge_close_cuts(
+    cuts: List[Tuple[float, float]],
+    max_gap_s: float = 5.0,
+    silences: List | None = None,
+    highlights: List[float] | None = None,
+) -> List[Tuple[float, float]]:
+    """If two adjacent cuts have a small gap AND the gap is entirely silent
+    in the audio, merge them. Tiny silent gaps between cuts produce
+    micro-keep-slivers (1-5s flashes of dead air between long cuts) which
+    are useless and choppy.
+
+    Crucially: only merge gaps that are TRULY silent. The model sometimes
+    leaves small gaps because there's a quick joke / reaction / quip in
+    them that's worth keeping. We rely on the loudness analysis's silence
+    intervals — only merge a gap if it falls entirely inside a detected
+    silence.
+
+    Without `silences` provided, this is a no-op (safe default — don't
+    risk merging over content)."""
+    if not cuts or not silences:
+        return cuts
+    highlights = highlights or []
+    sorted_cuts = sorted(cuts)
+    sil = sorted([(s[0], s[1]) for s in silences])
+
+    def _gap_fully_silent(prev_e: float, cs: float) -> bool:
+        """True if [prev_e, cs] is fully covered by silence intervals
+        (allowing multiple, possibly with sub-100ms breaks)."""
+        gap_len = cs - prev_e
+        if gap_len <= 0:
+            return True
+        covered = 0.0
+        for ss, se in sil:
+            if se <= prev_e:
+                continue
+            if ss >= cs:
+                break
+            covered += min(se, cs) - max(ss, prev_e)
+        return covered >= gap_len - 0.1  # 100ms tolerance for window rounding
+
+    out = [sorted_cuts[0]]
+    for cs, ce in sorted_cuts[1:]:
+        prev_s, prev_e = out[-1]
+        gap = cs - prev_e
+        if 0 < gap < max_gap_s:
+            has_highlight = any(prev_e < h < cs for h in highlights)
+            if _gap_fully_silent(prev_e, cs) and not has_highlight:
+                out[-1] = (prev_s, ce)
+                continue
+        out.append((cs, ce))
+    return out
+
+
 def extract_highlights_from_response(response: str) -> List[float]:
     """Parse the HIGHLIGHTS_BEGIN..HIGHLIGHTS_END block and return the list
     of highlight timestamps in seconds. Returns [] if no highlights block."""
