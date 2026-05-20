@@ -38,7 +38,7 @@ def analyze(video_path: str, video_id: str, segments: list) -> dict:
         print(f"[loudness] cache hit: {out_path}")
         return load_json(out_path)
 
-    wav_path = os.path.join(cache_dir(video_id), "audio.wav")
+    wav_path = os.path.join(cache_dir(video_id), "loudness_audio.wav")
     _extract_wav(video_path, wav_path)
 
     audio, sr = sf.read(wav_path, dtype="float32")

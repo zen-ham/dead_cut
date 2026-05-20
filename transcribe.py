@@ -45,7 +45,7 @@ def transcribe(
     batch_size: int = DEFAULT_BATCH,
 ) -> dict:
     """Return {duration, segments: [{start, end, text}], language}. Cached as JSON."""
-    out_path = os.path.join(cache_dir(video_id), "transcript.json")
+    out_path = os.path.join(cache_dir(video_id), "transcribe.json")
     if os.path.exists(out_path):
         print(f"[transcribe] cache hit: {out_path}")
         return load_json(out_path)

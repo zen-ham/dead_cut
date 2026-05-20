@@ -181,7 +181,7 @@ def detect_cuts(
     # Local import to avoid a circular dependency at module load time.
     from .parser import parse_cuts
 
-    out_path = os.path.join(cache_dir(video_id), f"llm_response_iter{iteration}.json")
+    out_path = os.path.join(cache_dir(video_id), f"llm_iter{iteration}.json")
     if os.path.exists(out_path):
         d = load_json(out_path)
         print(f"[llm] cache hit (iter {iteration}): {out_path}")

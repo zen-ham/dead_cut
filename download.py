@@ -106,9 +106,9 @@ def fetch_duration(url: str) -> float | None:
 
 
 def download(url: str, video_id: str) -> str:
-    """Download best mp4 (video+audio merged) to cache/<id>/source.mp4. Returns path."""
+    """Download best mp4 (video+audio merged) to cache/<id>/vid_src.mp4. Returns path."""
     out_dir = cache_dir(video_id)
-    out_path = os.path.join(out_dir, "source.mp4")
+    out_path = os.path.join(out_dir, "vid_src.mp4")
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
         print(f"[download] cache hit: {out_path}")
         # Still check codec on cache hit — user might have a stale AV1 source
@@ -164,7 +164,7 @@ def download(url: str, video_id: str) -> str:
             "bestvideo[height<=720]+bestaudio/"
             "best[height<=720]/best"
         ),
-        "outtmpl": os.path.join(out_dir, "source.%(ext)s"),
+        "outtmpl": os.path.join(out_dir, "vid_src.%(ext)s"),
         "merge_output_format": "mp4",
         # Suppress yt-dlp's own stdout output — the tqdm bar from _hook
         # replaces it. Errors still print (quiet=True only kills info-level).
@@ -196,13 +196,13 @@ def download(url: str, video_id: str) -> str:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
-    # yt-dlp may write source.mp4 or source.mkv depending on merge; normalise.
-    for cand in ("source.mp4", "source.mkv", "source.webm"):
+    # yt-dlp may write vid_src.mp4 or vid_src.mkv/.webm depending on merge;
+    # normalise to vid_src.mp4 so downstream stages have a stable filename.
+    for cand in ("vid_src.mp4", "vid_src.mkv", "vid_src.webm"):
         p = os.path.join(out_dir, cand)
         if os.path.exists(p):
-            if cand != "source.mp4":
-                # rename so downstream stages have a stable filename
-                target = os.path.join(out_dir, "source.mp4")
+            if cand != "vid_src.mp4":
+                target = os.path.join(out_dir, "vid_src.mp4")
                 os.replace(p, target)
                 _warn_if_slow_codec(target)
                 return target

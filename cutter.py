@@ -57,7 +57,7 @@ def _cut_streamcopy(
     output_path: str,
     work_dir: str,
 ) -> None:
-    segments_dir = os.path.join(work_dir, "segments")
+    segments_dir = os.path.join(work_dir, "cutter_segments")
     os.makedirs(segments_dir, exist_ok=True)
     for f in os.listdir(segments_dir):
         if f.startswith("seg_") and f.endswith(".mp4"):
@@ -80,7 +80,7 @@ def _cut_streamcopy(
             raise RuntimeError(f"ffmpeg produced empty segment for {s:.1f}-{e:.1f}")
         seg_paths.append(seg_path)
 
-    list_path = os.path.join(work_dir, "concat_list.txt")
+    list_path = os.path.join(work_dir, "cutter_concat_list.txt")
     with open(list_path, "w", encoding="utf-8") as f:
         for p in seg_paths:
             f.write(f"file '{p.replace(os.sep, '/')}'\n")
@@ -190,8 +190,8 @@ def _splice_audio(
     """
     sr = 48000
     channels = 2
-    full_wav = os.path.join(work_dir, "audio_full.wav")
-    out_wav = os.path.join(work_dir, "audio_spliced.wav")
+    full_wav = os.path.join(work_dir, "cutter_audio_full.wav")
+    out_wav = os.path.join(work_dir, "cutter_audio_spliced.wav")
 
     # 1. Decode source to a clean wav we can random-access.
     if not os.path.exists(full_wav) or os.path.getsize(full_wav) == 0:
@@ -315,7 +315,7 @@ def _cut_reencode(
 
     # 2. Build the (now small) video-only filter script — also using snapped.
     filter_script = _build_video_filter_script(keep_ranges)
-    script_path = os.path.join(work_dir, "filter_complex.txt")
+    script_path = os.path.join(work_dir, "cutter_filter.txt")
     with open(script_path, "w", encoding="utf-8") as f:
         f.write(filter_script)
 

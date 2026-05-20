@@ -21,7 +21,7 @@ def _overlaps(seg_start, seg_end, keep_start, keep_end):
 
 def synthesize(video_id: str, iteration: int = 1) -> str:
     cdir = cache_dir(video_id)
-    transcript = load_json(os.path.join(cdir, "transcript.json"))
+    transcript = load_json(os.path.join(cdir, "transcribe.json"))
     summary = load_json(os.path.join(cdir, f"summary_iter{iteration}.json"))
     keep_ranges = [tuple(r) for r in summary["keep_ranges"]]
     duration = transcript["duration"]

@@ -33,7 +33,45 @@ def video_id_from_url(url: str) -> str:
 def cache_dir(video_id: str) -> str:
     d = os.path.join(CACHE_ROOT, video_id)
     os.makedirs(d, exist_ok=True)
+    _migrate_legacy_names(d)
     return d
+
+
+# Rename map: old cache filenames -> new (stage-prefixed) names.
+# Run once at cache_dir() so existing caches keep working without re-downloading.
+# To redo a pipeline stage now, you can just `rm` the files matching that
+# stage's prefix: vid_*, transcribe*, loudness*, llm_*, cutter_*.
+_LEGACY_NAMES = {
+    "source.mp4":         "vid_src.mp4",
+    "audio.wav":          "loudness_audio.wav",
+    "transcript.json":    "transcribe.json",
+    "audio_full.wav":     "cutter_audio_full.wav",
+    "audio_spliced.wav":  "cutter_audio_spliced.wav",
+    "filter_complex.txt": "cutter_filter.txt",
+    "concat_list.txt":    "cutter_concat_list.txt",
+    "segments":           "cutter_segments",
+}
+
+
+def _migrate_legacy_names(cache_dir_path: str) -> None:
+    try:
+        existing = os.listdir(cache_dir_path)
+    except OSError:
+        return
+    for old in existing:
+        new = _LEGACY_NAMES.get(old)
+        # Pattern rename for llm_response_iter*.json -> llm_iter*.json
+        if new is None and old.startswith("llm_response_iter") and old.endswith(".json"):
+            new = old.replace("llm_response_iter", "llm_iter", 1)
+        if not new:
+            continue
+        old_path = os.path.join(cache_dir_path, old)
+        new_path = os.path.join(cache_dir_path, new)
+        if not os.path.exists(new_path):
+            try:
+                os.rename(old_path, new_path)
+            except OSError:
+                pass  # don't crash the pipeline if rename fails
 
 
 def save_json(path: str, obj) -> None:
