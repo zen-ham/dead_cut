@@ -1,15 +1,18 @@
 """ffmpeg-based trimmer with sample-precise cuts.
 
-Two strategies:
-- few segments, large each: stream-copy via concat demuxer (fast, no re-encode loss,
-  cut points snap to nearest keyframe — fine for ~2-10s precision).
-- many small segments (post-trim): SINGLE filter_complex pass with trim+concat,
-  re-encoded once. Stream-copy is unsuitable here because every cut rounds
-  outward to the nearest keyframe, accumulating multi-minute duration drift
-  across 100+ tiny segments.
+Three strategies, auto-selected:
+- few large segments  -> stream-copy via concat demuxer (no re-encode, keyframe
+  rounded — fine for ~2-10s precision).
+- many h264 segments  -> smartcut (PyAV) with h264_nvenc patched in for the
+  boundary GOP re-encodes. Stream-copies all non-boundary GOPs, re-encodes only
+  the GOPs touching a cut. ~2x faster than the full-reencode path on the same
+  GPU and the audio is passed through (no re-encode, no quality loss).
+- everything else     -> full filter_complex re-encode via h264_nvenc. Falls
+  through here for non-h264 sources or if smartcut+nvenc bails for any reason.
 
-Auto-selects based on segment count + minimum segment length. Prefers h264_nvenc
-when the encoder is available (much faster on NVIDIA GPUs).
+Stream-copy is unsuitable for many small cuts because every cut rounds outward
+to the nearest keyframe, accumulating multi-minute duration drift across 100+
+tiny segments.
 """
 import os
 import re
@@ -26,7 +29,7 @@ from . import progress
 
 
 # Re-encode triggers: many segments OR short segments mean stream-copy drift
-# will be visible. Past these thresholds, switch to filter_complex re-encode.
+# will be visible. Past these thresholds, switch to a re-encode strategy.
 REENCODE_SEG_COUNT = 30
 REENCODE_MIN_SEG_S = 3.0
 
@@ -45,10 +48,24 @@ def cut_video(
         len(keep_ranges) > REENCODE_SEG_COUNT
         or any(e - s < REENCODE_MIN_SEG_S for s, e in keep_ranges)
     )
-    if need_reencode:
-        _cut_reencode(source_path, keep_ranges, output_path, work_dir)
-    else:
+    if not need_reencode:
         _cut_streamcopy(source_path, keep_ranges, output_path, work_dir)
+        return
+
+    # Prefer smartcut+nvenc when the source codec is h264 and nvenc is
+    # available — partial re-encode that benchmarked ~2x faster than the
+    # full-reencode path. Fall through to _cut_reencode on any failure or
+    # for non-h264 sources (smartcut needs matching codec, AV1 has no
+    # boundary-encode GPU support on pre-Ada cards).
+    src_codec = _get_source_video_codec(source_path)
+    if src_codec == "h264" and _has_h264_nvenc():
+        try:
+            _cut_smartcut_nvenc(source_path, keep_ranges, output_path, work_dir)
+            return
+        except Exception as e:
+            print(f"[cutter] smartcut+nvenc failed ({type(e).__name__}: {e}); "
+                  f"falling back to full re-encode")
+    _cut_reencode(source_path, keep_ranges, output_path, work_dir)
 
 
 def _cut_streamcopy(
@@ -99,6 +116,174 @@ def _cut_streamcopy(
 
     total_keep = sum(e - s for s, e in keep_ranges)
     print(f"[cutter] stream-copy: wrote {output_path} ({len(seg_paths)} segments, {total_keep:.1f}s kept)")
+
+
+def _get_source_video_codec(source_path: str) -> str | None:
+    """Probe the source's video stream codec name (e.g. 'h264', 'av1', 'vp9').
+    Returns None on probe failure."""
+    try:
+        r = subprocess.run([
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name",
+            "-of", "default=noprint_wrappers=1:nokey=1", source_path,
+        ], capture_output=True, text=True, timeout=10)
+        out = (r.stdout or "").strip()
+        return out or None
+    except Exception:
+        return None
+
+
+_nvenc_cache: bool | None = None
+
+def _has_h264_nvenc() -> bool:
+    """Cache-check ffmpeg's encoder list for h264_nvenc availability."""
+    global _nvenc_cache
+    if _nvenc_cache is None:
+        try:
+            out = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-encoders"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout
+            _nvenc_cache = "h264_nvenc" in out
+        except Exception:
+            _nvenc_cache = False
+    return _nvenc_cache
+
+
+_smartcut_nvenc_patched = False
+
+def _patch_smartcut_for_nvenc() -> None:
+    """Monkey-patch smartcut's VideoCutter so its boundary-GOP re-encodes use
+    h264_nvenc instead of the source's default encoder (libx264).
+
+    Smartcut's SMARTCUT mode normally creates the encoder from the source
+    codec name (-> libx264 for h264 source). codec_override only takes effect
+    in RECODE mode, which re-encodes every frame and defeats the point. The
+    wrap is in two places:
+      1. __init__: after the original sets self.codec_name from the source,
+         flip it to 'h264_nvenc' when source is h264.
+      2. init_encoder: after the original sets self.encoding_options (with
+         libx264-specific keys like crf and x264-params), replace it with
+         nvenc-appropriate options. The encoder context is built lazily from
+         self.codec_name + self.encoding_options inside _ensure_enc_codec.
+    Idempotent — safe to call multiple times.
+    """
+    global _smartcut_nvenc_patched
+    if _smartcut_nvenc_patched:
+        return
+    import smartcut.cut_video as scv
+
+    orig_init = scv.VideoCutter.__init__
+    orig_init_encoder = scv.VideoCutter.init_encoder
+
+    def patched_init(self, mc, oac, vs, log_level):
+        orig_init(self, mc, oac, vs, log_level)
+        if vs.mode == scv.VideoExportMode.SMARTCUT and self.codec_name == "h264":
+            self.codec_name = "h264_nvenc"
+
+    def patched_init_encoder(self):
+        orig_init_encoder(self)
+        if self.codec_name == "h264_nvenc":
+            # Match the full-reencode path's settings (cutter.py:_pick_video_encoder).
+            # p1 = fastest NVENC preset; quality difference vs p4 is invisible on
+            # already-lossy YouTube source.
+            self.encoding_options = {
+                "preset": "p1",
+                "rc": "vbr",
+                "cq": "23",
+                "b:v": "0",
+            }
+
+    scv.VideoCutter.__init__ = patched_init
+    scv.VideoCutter.init_encoder = patched_init_encoder
+    _smartcut_nvenc_patched = True
+
+
+class _SmartcutProgress:
+    """Adapter from smartcut's emit(int) protocol to our tqdm bar + overall
+    pipeline progress tracker. First emit = total; subsequent emits = current."""
+    def __init__(self, label: str):
+        self.label = label
+        self.total: int | None = None
+        self.pbar: tqdm | None = None
+
+    def emit(self, value: int) -> None:
+        if self.total is None:
+            self.total = max(1, int(value))
+            self.pbar = tqdm(
+                total=self.total, unit="seg",
+                desc=f"[stage   ] {self.label}",
+                bar_format="{desc} {bar} {percentage:3.0f}% | {n}/{total} segs | eta {remaining}",
+                position=1, leave=False,
+            )
+            return
+        cur = int(value)
+        if self.pbar is not None:
+            if cur > self.pbar.n:
+                self.pbar.update(cur - self.pbar.n)
+            progress.report_stage_rate("encode", cur / max(self.total, 1))
+            progress.tick()
+
+    def close(self) -> None:
+        if self.pbar is not None:
+            self.pbar.n = self.pbar.total
+            self.pbar.refresh()
+            self.pbar.close()
+
+
+def _cut_smartcut_nvenc(
+    source_path: str,
+    keep_ranges: List[Tuple[float, float]],
+    output_path: str,
+    work_dir: str,
+) -> None:
+    """Partial re-encode via the smartcut library, with h264_nvenc patched in
+    for the boundary GOPs. Stream-copies all non-boundary GOPs; only decodes
+    + re-encodes the GOPs touching a cut. Audio is passed through unchanged
+    (lossless), so the python audio splice path is bypassed.
+
+    Benchmarked ~2x faster than _cut_reencode on a 45min h264 720p60 source
+    with 221 cuts (49s vs 102s).
+    """
+    from fractions import Fraction
+    from smartcut.cut_video import (
+        smart_cut, VideoSettings, VideoExportMode, VideoExportQuality,
+        AudioExportInfo, AudioExportSettings,
+    )
+    from smartcut.media_container import MediaContainer
+
+    _patch_smartcut_for_nvenc()
+
+    source = MediaContainer(source_path)
+    # smartcut uses Fraction internally; limit_denominator avoids
+    # float-to-Fraction precision blowup on long timestamps.
+    segments = [(Fraction(s).limit_denominator(1_000_000),
+                 Fraction(e).limit_denominator(1_000_000))
+                for s, e in keep_ranges]
+
+    audio_settings = [AudioExportSettings(codec="passthru")] * len(source.audio_tracks)
+    export_info = AudioExportInfo(output_tracks=audio_settings)
+    video_settings = VideoSettings(VideoExportMode.SMARTCUT, VideoExportQuality.NORMAL, "copy")
+
+    total_keep = sum(e - s for s, e in keep_ranges)
+    print(f"[cutter] smartcut+h264_nvenc: {len(keep_ranges)} segments ({total_keep:.1f}s)...")
+
+    cb = _SmartcutProgress("[cutter] smartcut+nvenc")
+    try:
+        exc = smart_cut(
+            source, segments, output_path,
+            audio_export_info=export_info,
+            video_settings=video_settings,
+            progress=cb, log_level=None,
+        )
+    finally:
+        cb.close()
+
+    if exc is not None:
+        raise exc
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        raise RuntimeError(f"smartcut produced no output at {output_path}")
+    print(f"[cutter] wrote {output_path}")
 
 
 def _get_source_frame_rate(source_path: str) -> float | None:
