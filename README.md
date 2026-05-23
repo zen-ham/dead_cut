@@ -15,6 +15,12 @@ The way it actually does this is a 2 layer system of editing, first the AI does 
 
 Every run drops a `cuts.json` next to `final.mp4` with the source duration, every cut range, every keep range, and highlight markers in source-second timestamps. Import it into DaVinci / Premiere / your own scripts if you want to do something other than (or on top of) the auto-encoded mp4.
 
+Every run also drops a `pipeline_visual.png` showing where every stage's time went, where every detected silence / highlight / AI cut landed on the source timeline, and what got kept vs cut in the final:
+
+<p align="center">
+    <img src="https://github.com/zen-ham/dead_cut/blob/master/repo_assets/pipeline_visual.png" width="100%" />
+</p>
+
 Pipeline Technical Details:
 -
 
