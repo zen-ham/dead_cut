@@ -167,6 +167,95 @@ def _hms(t: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+UNCOVERED_BOUNDARY_LINE = "=== GAP — already cut or protected, DO NOT cut across this line ==="
+
+
+def build_uncovered_prompt(
+    duration: float,
+    kept_segments: list,
+    loudness_per_seg: list,
+    kept_regions: list,
+    target: dict,
+) -> str:
+    """Like build_user_prompt but with explicit boundary markers between
+    non-contiguous kept regions. Prevents the model from outputting cuts
+    that span across an existing-cut or highlight zone (which it would
+    otherwise do because the filtered transcript looks contiguous to it).
+
+    kept_segments: filtered segments list
+    loudness_per_seg: matching loudness entries for kept_segments
+    kept_regions: list of (start, end) tuples for the kept regions in
+        absolute video time. Used to detect boundary crossings between
+        consecutive segments."""
+    # Expected cut count derived from target % (not raw duration), so the
+    # uncovered prompt's "aim for N cuts" matches its lower target %.
+    target_cut_secs = duration * target["ai_cut_pct"] / 100.0
+    typical_cut_s = 240.0  # ~4 min per cut
+    cut_target_low = max(3, int(round(target_cut_secs / typical_cut_s * 0.7)))
+    cut_target_high = max(6, int(round(target_cut_secs / typical_cut_s * 1.3)))
+    cut_target_low_strict = max(3, int(round(target_cut_secs / typical_cut_s * 0.5)))
+    silence_ratio_total = float(target.get("silence_trim_ratio", 0.0))
+    ai_keep_frac = max(0.05, 1.0 - target["ai_cut_pct"] / 100.0)
+    est_silence_trim_pct = round(100.0 * silence_ratio_total * ai_keep_frac)
+    header = USER_PROMPT_HEADER.format(
+        duration_str=_hms(duration),
+        duration_sec=duration,
+        target_pct=target["ai_cut_pct"],
+        floor_pct=target["floor_pct"],
+        ceiling_pct=target["ceiling_pct"],
+        target_cut_str=_hms(duration * target["ai_cut_pct"] / 100.0),
+        floor_cut_str=_hms(duration * target["floor_pct"] / 100.0),
+        ceiling_cut_str=_hms(duration * target["ceiling_pct"] / 100.0),
+        est_silence_trim_pct=est_silence_trim_pct,
+        cut_target_low=cut_target_low,
+        cut_target_high=cut_target_high,
+        cut_target_low_strict=cut_target_low_strict,
+    )
+    # Build region-index lookup so we can tell when consecutive segments
+    # belong to different kept regions.
+    region_starts = [r[0] for r in kept_regions]
+    region_ends = [r[1] for r in kept_regions]
+
+    def region_index_of(t: float) -> int:
+        # Binary search would be faster but kept_regions is small; linear scan is fine.
+        for i, (rs, re_) in enumerate(zip(region_starts, region_ends)):
+            if rs <= t <= re_:
+                return i
+        return -1
+
+    lines = [
+        header,
+        f"NOTE: only some of the video's transcript is shown below. The "
+        f"surrounding parts have already been cut by an earlier pass OR "
+        f"contain highlights that must be preserved. Wherever you see "
+        f"`=== GAP ===` markers, treat them as hard boundaries — your cut "
+        f"ranges must NOT span across one of them. Cut only inside the "
+        f"shown timestamp regions.",
+        "",
+        f"CRITICAL OUTPUT ORDER: list your cut ranges in REVERSE "
+        f"chronological order — LATEST timestamp first, EARLIEST last. "
+        f"This is required because earlier passes under-cut the LATE "
+        f"parts of the video. By writing the late cuts first, you ensure "
+        f"your attention goes to the end before you fill the budget. "
+        f"Example:",
+        f"  CUTS_BEGIN",
+        f"  HH:MM:SS-HH:MM:SS — your LATEST cut (highest timestamp)",
+        f"  HH:MM:SS-HH:MM:SS — second-latest",
+        f"  ...",
+        f"  HH:MM:SS-HH:MM:SS — earliest cut (lowest timestamp, listed last)",
+        f"  CUTS_END",
+        "",
+    ]
+    prev_region = None
+    for seg, loud in zip(kept_segments, loudness_per_seg):
+        idx = region_index_of(seg["start"])
+        if prev_region is not None and idx != prev_region:
+            lines.append(UNCOVERED_BOUNDARY_LINE)
+        lines.append(format_segment_line(seg, loud))
+        prev_region = idx
+    return "\n".join(lines)
+
+
 def build_user_prompt(
     duration: float,
     segments: list,

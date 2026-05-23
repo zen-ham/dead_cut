@@ -5,7 +5,7 @@ import time
 import requests
 
 from .cache import cache_dir, save_json, load_json
-from .prompts import SYSTEM_PROMPT, build_user_prompt
+from .prompts import SYSTEM_PROMPT, build_user_prompt, build_uncovered_prompt
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -178,6 +178,172 @@ def check_coverage(cuts: list, duration: float, max_gap_frac: float = 0.25) -> d
         "longest_gap_frac": longest_dur / duration,
         "n_gaps": len(gaps),
     }
+
+
+def _compute_uncovered_regions(
+    duration: float, cuts: list, highlights: list, hl_pad_s: float = 3.0,
+) -> list:
+    """Return [(start, end)] of timeline ranges NOT inside an existing cut
+    and NOT within hl_pad_s of any highlight. These are the candidate
+    regions the uncovered-regions revision will operate on."""
+    if duration <= 0:
+        return []
+    # Build "blocked" intervals: cuts + highlight pads
+    blocked = sorted([(float(s), float(e)) for s, e in cuts])
+    for h in highlights or []:
+        h = float(h)
+        blocked.append((max(0.0, h - hl_pad_s), min(duration, h + hl_pad_s)))
+    blocked.sort()
+    # Merge blocked
+    merged_blocked = []
+    for s, e in blocked:
+        if merged_blocked and s <= merged_blocked[-1][1]:
+            merged_blocked[-1] = (merged_blocked[-1][0], max(merged_blocked[-1][1], e))
+        else:
+            merged_blocked.append((s, e))
+    # Invert blocked to find uncovered
+    regions = []
+    cursor = 0.0
+    for s, e in merged_blocked:
+        if s > cursor:
+            regions.append((cursor, s))
+        cursor = max(cursor, e)
+    if cursor < duration:
+        regions.append((cursor, duration))
+    return regions
+
+
+def _score_uncovered_region(
+    region: tuple, segments: list, typical_wps: float = 3.0,
+) -> float:
+    """Heuristic 'needs cutting' score 0-2. Higher = more boring/sparse.
+    Long regions with low word density score highest (definitely need
+    cutting). Short dense regions score lowest (already content-rich)."""
+    rs, re_ = region
+    region_dur = max(0.001, re_ - rs)
+    word_count = 0
+    for seg in segments:
+        if seg["end"] <= rs:
+            continue
+        if seg["start"] >= re_:
+            break
+        # Count words inside region
+        for w in seg.get("words", []):
+            if rs <= w["start"] <= re_:
+                word_count += 1
+    wps = word_count / region_dur
+    density_norm = min(wps / typical_wps, 1.0)
+    # duration_norm normalized at call site (depends on max region in the set)
+    return region_dur, density_norm  # returns raw values; caller normalizes
+
+
+def revise_cuts_uncovered_regions(
+    duration: float,
+    segments: list,
+    loudness_per_seg: list,
+    current_cuts: list,
+    highlights: list,
+    target: dict,
+    highlight_pad_s: float = 3.0,
+    drop_well_cut_frac: float = 0.5,
+    force_model: str | None = None,
+) -> str | None:
+    """Re-feed the LLM only the parts of the video it HASN'T already cut,
+    with highlight zones excised AND with already-well-cut sub-regions
+    dropped, AND with explicit boundary markers between kept regions.
+
+    Process:
+      1. Compute uncovered regions (timeline not inside existing cut +
+         not inside highlight pad).
+      2. Score each region by 'needs cutting' heuristic:
+         duration_norm + (1 - density_norm)  -- long+sparse = high score.
+      3. Drop the lowest-scoring drop_well_cut_frac of regions (well-cut
+         areas the model doesn't need to revisit).
+      4. Filter segments to only those inside kept regions.
+      5. Build prompt with boundary markers between non-contiguous kept
+         regions so the model can't cut across an existing-cut/highlight
+         zone.
+
+    Strategy: "bouncing ball" recovery. If primary missed regions or
+    under-cut, reset the model on a fresh transcript of just what really
+    needs work."""
+    if not segments:
+        return None
+
+    # Step 1: compute uncovered regions.
+    uncovered = _compute_uncovered_regions(duration, current_cuts, highlights, highlight_pad_s)
+    if not uncovered:
+        print(f"[llm] uncovered-regions: nothing uncovered, skipping")
+        return None
+
+    # Step 2-3: score each region, drop bottom drop_well_cut_frac.
+    scored = []  # (score, region, region_dur, density_norm)
+    max_dur = max(re_ - rs for rs, re_ in uncovered) if uncovered else 1.0
+    for region in uncovered:
+        region_dur, density_norm = _score_uncovered_region(region, segments)
+        duration_norm = min(region_dur / max(max_dur, 1e-6), 1.0)
+        score = duration_norm + (1.0 - density_norm)
+        scored.append((score, region, region_dur, density_norm))
+    scored.sort(key=lambda x: x[0], reverse=True)  # highest score first
+    n_keep = max(1, int(round(len(scored) * (1.0 - drop_well_cut_frac))))
+    kept_scored = scored[:n_keep]
+    kept_regions = sorted([s[1] for s in kept_scored])
+
+    print(f"[llm] uncovered-regions: {len(uncovered)} regions found, "
+          f"keeping top {n_keep} by needs-cutting score (dropped {len(uncovered) - n_keep} well-cut)")
+    # Show stats on what's kept vs dropped
+    kept_total = sum(re_ - rs for rs, re_ in kept_regions)
+    dropped_total = sum(s[2] for s in scored[n_keep:])
+    print(f"[llm]   kept region total: {kept_total:.0f}s ({kept_total/60:.1f}min)")
+    print(f"[llm]   dropped region total: {dropped_total:.0f}s ({dropped_total/60:.1f}min)")
+
+    # Step 4: filter segments to those overlapping any kept region.
+    def in_kept(s: float, e: float) -> bool:
+        for rs, re_ in kept_regions:
+            if rs >= e:
+                break
+            if re_ > s:
+                return True
+        return False
+
+    filt_segs = []
+    filt_loud = []
+    for seg, loud in zip(segments, loudness_per_seg):
+        if in_kept(float(seg["start"]), float(seg["end"])):
+            filt_segs.append(seg)
+            filt_loud.append(loud)
+    if not filt_segs:
+        print(f"[llm] uncovered-regions: no segments inside kept regions, skipping")
+        return None
+
+    # Adjust target % to the REMAINING budget. Otherwise the model targets
+    # the full ai_cut_pct each iteration and over-cuts (observed 79% on
+    # an 8hr vod when iter target was 55%, already at 43%, model added
+    # another 36% on top). With remaining-budget target the model aims for
+    # just what's left.
+    current_cut_secs = sum(e - s for s, e in current_cuts)
+    current_pct = 100.0 * current_cut_secs / max(duration, 1e-6)
+    remaining_pct = max(3, int(round(target["ai_cut_pct"] - current_pct)))
+    iter_target = dict(target)
+    iter_target["ai_cut_pct"] = remaining_pct
+    iter_target["floor_pct"] = max(1, remaining_pct - 3)
+    iter_target["ceiling_pct"] = remaining_pct + 5
+    print(f"[llm]   adjusted target for this iter: cut ~{remaining_pct}% more "
+          f"(was at {current_pct:.1f}%, full target {target['ai_cut_pct']}%)")
+
+    # Step 5: build prompt with boundary markers.
+    user_prompt = build_uncovered_prompt(
+        duration=duration,
+        kept_segments=filt_segs,
+        loudness_per_seg=filt_loud,
+        kept_regions=kept_regions,
+        target=iter_target,
+    )
+    print(f"[llm] uncovered-regions revision: {len(filt_segs)}/{len(segments)} "
+          f"segments shown ({len(segments) - len(filt_segs)} hidden)")
+    print(f"[llm]   filtered prompt: {len(user_prompt)} chars")
+    model, resp = call_llm(SYSTEM_PROMPT, user_prompt, force_model=force_model)
+    return resp
 
 
 def revise_cuts_coverage(
@@ -809,16 +975,17 @@ BUDGET_FLOOR = 0.50
 STRUCTURE_REVISION_ATTEMPTS = 3
 
 # Coverage check threshold: any continuous uncut region exceeding this
-# fraction of total duration triggers an additional revision pass that
-# tells the model "find cuts here, you missed this range". 0.25 = 25% of
+# fraction of total duration triggers further revision. 0.25 = 25% of
 # source. On a 86-min video, this fires if 21+ minutes are uncut.
 COVERAGE_MAX_GAP_FRAC = 0.25
 
-# Max coverage revision iterations. One pass only targets the longest gap;
-# long vods with multiple uncovered regions need to loop. Each pass costs
-# one LLM call (1-3min on long vods). 3 is a balance between coverage
-# quality and runtime.
-COVERAGE_REVISION_MAX_ITERS = 3
+# Uncovered-regions revision: if final cut % is below floor OR any single
+# uncut region exceeds UNCOVERED_REGION_MAX_S, re-feed the model just the
+# parts of the video it didn't already cut (with highlights subtracted) and
+# let it cut from scratch on that filtered transcript. Replaces the old
+# under-floor + coverage revisions with a single mechanism.
+UNCOVERED_REV_MAX_ITERS = 2
+UNCOVERED_REGION_MAX_S = 1800.0  # 30 minutes
 
 
 def detect_cuts(
@@ -859,8 +1026,9 @@ def detect_cuts(
         print(f"[llm] cache hit (iter {iteration}): {out_path}")
         return (
             d["model"],
-            d.get("final_response") or d.get("revised_response")
-                or d.get("structure_response") or d["response"],
+            (d.get("final_response") or d.get("uncovered_response")
+                or d.get("coverage_response") or d.get("revised_response")
+                or d.get("structure_response") or d["response"]),
             d["response"],
         )
 
@@ -901,6 +1069,7 @@ def detect_cuts(
     revised_resp = None
     structure_resp = None
     coverage_resp = None
+    uncovered_resp = None
     cut_pct_first = None
     cut_pct_revised = None
     try:
@@ -1002,164 +1171,98 @@ def detect_cuts(
                 print(bar)
                 print()
 
-        revise_fn = None
-        revise_target = None
+        # OVER-BUDGET REVISION: if the (structure-revised) cuts exceed
+        # ceiling, ask the model to drop its least-confident cuts. The
+        # under-floor case is handled by the uncovered-regions loop below,
+        # which is a cleaner "reset" mechanism than the old coaxing.
         if cut_pct_first / 100.0 > ceiling_frac:
             print(
                 f"\n[WARNING] model over-cut on first pass: "
                 f"{len(first_cuts)} cuts totalling {cut_pct_first:.1f}% "
                 f"(ceiling {target['ceiling_pct']}%). Requesting revision...\n"
             )
-            revise_fn = revise_cuts_over_budget
-            revise_target = target["ai_cut_pct"]
-        elif cut_pct_first / 100.0 < floor_frac:
-            print(
-                f"\n[WARNING] model under-cut on first pass: "
-                f"{len(first_cuts)} cuts totalling {cut_pct_first:.1f}% "
-                f"(floor {target['floor_pct']}%). Requesting revision...\n"
-            )
-            revise_fn = revise_cuts_under_floor
-            revise_target = target["ai_cut_pct"]
-        if revise_fn is not None:
-            revise_kwargs = dict(
+            revised_resp = revise_cuts_over_budget(
                 model=model, system=SYSTEM_PROMPT, user=user_prompt,
                 original_response=resp,
                 actual_cut_pct=cut_pct_first,
                 duration_s=duration,
-                target_pct=revise_target,
+                target_pct=target["ai_cut_pct"],
             )
-            # Under-cut revision needs the parsed primary cuts so the model
-            # can see which regions are already covered and target the gaps.
-            if revise_fn is revise_cuts_under_floor:
-                revise_kwargs["primary_cuts"] = list(first_cuts)
-            revised_resp = revise_fn(**revise_kwargs)
             if revised_resp:
-                final_resp = revised_resp
                 try:
                     rev_cuts = parse_cuts(revised_resp, max_duration=duration)
                 except Exception as e:
-                    print(f"[llm] couldn't parse revision: {e}")
+                    print(f"[llm] couldn't parse over-budget revision: {e}")
                     rev_cuts = None
                 if rev_cuts is not None:
-                    if revise_fn is revise_cuts_under_floor:
-                        # Under-cut: model was told to output ONLY new additional
-                        # cuts. Merge them with primary cuts here so the model
-                        # doesn't have to copy its own first-pass output (a load
-                        # it was demonstrably failing to carry, dropping originals
-                        # and only re-listing a partial set).
-                        merged = _union_intervals(list(first_cuts) + list(rev_cuts))
-                        merged_secs = sum(e - s for s, e in merged)
-                        cut_pct_revised = 100.0 * merged_secs / max(duration, 1e-6)
-                        consolidated = len(first_cuts) + len(rev_cuts) - len(merged)
-                        net_new_secs = merged_secs - first_cut_secs
-                        net_new_pct = 100.0 * net_new_secs / max(duration, 1e-6)
+                    final_resp = revised_resp
+                    cut_pct_revised = 100.0 * sum(e - s for s, e in rev_cuts) / max(duration, 1e-6)
+                    print(f"[llm] over-budget revision result: {len(rev_cuts)} cuts, "
+                          f"{cut_pct_revised:.1f}% cut")
+                    if cut_pct_revised / 100.0 > ceiling_frac:
                         print(
-                            f"[llm] under-cut merge: primary {len(first_cuts)} + "
-                            f"revision {len(rev_cuts)} -> {len(merged)} total"
+                            f"\n[WARNING] model STILL over-cut after revision: "
+                            f"{cut_pct_revised:.1f}% cut. Programmatic drop will run next.\n"
                         )
-                        if consolidated > 0:
-                            print(
-                                f"[llm]   revision absorbed {consolidated} existing "
-                                f"cuts via overlap, contributed only {net_new_secs:.0f}s "
-                                f"({net_new_pct:+.2f}% of source) of net-new coverage"
-                            )
-                        else:
-                            print(
-                                f"[llm]   revision added {net_new_secs:.0f}s "
-                                f"({net_new_pct:+.2f}% of source) of net-new coverage"
-                            )
-                        print(
-                            f"[llm]   final: {len(merged)} cuts, {cut_pct_revised:.1f}% cut "
-                            f"(was {cut_pct_first:.1f}%, {net_new_pct:+.1f}%)"
-                        )
-                        if cut_pct_revised / 100.0 < floor_frac:
-                            print(
-                                f"\n[WARNING] revision STILL under {target['floor_pct']}% "
-                                f"floor ({cut_pct_revised:.1f}% cut). No programmatic "
-                                f"remedy available — output will be looser than target.\n"
-                            )
-                        final_resp = _format_cuts_block(merged)
-                    else:
-                        # Over-cut: revised replaces primary as instructed.
-                        cut_pct_revised = 100.0 * sum(e - s for s, e in rev_cuts) / max(duration, 1e-6)
-                        print(f"[llm] revision result: {len(rev_cuts)} cuts, {cut_pct_revised:.1f}% cut")
-                        if cut_pct_revised / 100.0 > ceiling_frac:
-                            print(
-                                f"\n[WARNING] model STILL over-cut after revision: "
-                                f"{cut_pct_revised:.1f}% cut. Programmatic drop will run next.\n"
-                            )
 
-        # COVERAGE CHECK: after all structure/budget revisions, see if the
-        # final cut list leaves a big uncovered region. Fires an additional
-        # revision asking the model to find cuts in the uncovered range
-        # ONLY if we have budget room — if we're already at target % with
-        # bad coverage, adding more cuts would push over the ceiling.
-        # Structure rev (which fires first) should normally redistribute,
-        # so this is a safety net for the rare case where primary was
-        # non-chunked but missed a region.
+        # UNCOVERED-REGIONS REVISION: if cut % is below floor OR any single
+        # uncut region is too long, re-feed the model just the parts of the
+        # video it didn't cut (with highlights subtracted) and let it cut
+        # from scratch on that filtered transcript. Up to UNCOVERED_REV_MAX_ITERS
+        # passes — each pass shrinks the filtered transcript so it converges.
+        # Replaces the old under-floor and per-region coverage revisions.
         try:
             current_cuts = parse_cuts(final_resp, max_duration=duration)
         except Exception:
             current_cuts = list(first_cuts)
-        # Iterate coverage revisions: each pass targets the longest current
-        # gap and adds cuts inside it. For long vods with severe coverage
-        # failures (5hr+ uncut), one pass only nibbles at the longest gap —
-        # need to loop until either no gap remains or budget is exhausted.
-        # Cap iterations to avoid runaway LLM costs.
-        for cov_iter in range(1, COVERAGE_REVISION_MAX_ITERS + 1):
-            coverage_stats = check_coverage(current_cuts, duration, max_gap_frac=COVERAGE_MAX_GAP_FRAC)
-            if coverage_stats is None:
-                if cov_iter > 1:
-                    print(f"[llm] coverage check OK after {cov_iter-1} revision(s)")
+        from .parser import extract_highlights_from_response  # local import
+        highlights = extract_highlights_from_response(primary_resp) or []
+
+        for uc_iter in range(1, UNCOVERED_REV_MAX_ITERS + 1):
+            cut_secs = sum(e - s for s, e in current_cuts)
+            cut_pct = 100.0 * cut_secs / max(duration, 1e-6)
+            cov = check_coverage(current_cuts, duration, max_gap_frac=COVERAGE_MAX_GAP_FRAC)
+            longest_uncut = cov["longest_gap_s"] if cov else 0.0
+            needs_more = cut_pct < target["floor_pct"]
+            needs_coverage = longest_uncut > UNCOVERED_REGION_MAX_S
+            if not (needs_more or needs_coverage):
+                if uc_iter > 1:
+                    print(f"[llm] uncovered-regions: target met after {uc_iter - 1} revision(s)")
                 break
-            current_cut_secs = sum(e - s for s, e in current_cuts)
-            current_pct = 100.0 * current_cut_secs / max(duration, 1e-6)
-            ceiling_cut_secs = duration * target["ceiling_pct"] / 100.0
-            remaining_budget_s = ceiling_cut_secs - current_cut_secs
-            if remaining_budget_s < 60.0:
-                print(
-                    f"\n[WARNING] coverage gap remains ({coverage_stats['longest_gap_s']/60:.1f} "
-                    f"min uncut, {coverage_stats['longest_gap_frac']*100:.0f}% of source) "
-                    f"after {cov_iter-1} revision(s), BUT current {current_pct:.1f}% cut "
-                    f"already at/past ceiling {target['ceiling_pct']}%. Stopping.\n"
-                )
-                break
-            print(
-                f"\n[WARNING] coverage gap [iter {cov_iter}/{COVERAGE_REVISION_MAX_ITERS}]: "
-                f"{coverage_stats['longest_gap_s']/60:.1f} min uncut "
-                f"({coverage_stats['longest_gap_frac']*100:.0f}% of source). "
-                f"Current {current_pct:.1f}% cut, {remaining_budget_s/60:.1f} min to ceiling. "
-                f"Firing coverage revision...\n"
+            reasons = []
+            if needs_more:
+                reasons.append(f"cut {cut_pct:.1f}% < floor {target['floor_pct']}%")
+            if needs_coverage:
+                reasons.append(f"uncut region {longest_uncut/60:.0f}min > "
+                               f"{UNCOVERED_REGION_MAX_S/60:.0f}min cap")
+            print(f"\n[WARNING] uncovered-regions revision "
+                  f"[iter {uc_iter}/{UNCOVERED_REV_MAX_ITERS}]: {', '.join(reasons)}\n")
+            uc_resp = revise_cuts_uncovered_regions(
+                duration=duration, segments=segments, loudness_per_seg=loudness_per_seg,
+                current_cuts=list(current_cuts), highlights=highlights,
+                target=target, force_model=force_model,
             )
-            cov_resp = revise_cuts_coverage(
-                model=model, system=SYSTEM_PROMPT, user=user_prompt,
-                original_response=primary_resp,
-                duration_s=duration,
-                coverage_stats=coverage_stats,
-                primary_cuts=list(current_cuts),
-                remaining_budget_s=remaining_budget_s,
-            )
-            if not cov_resp:
-                print(f"[llm] coverage revision returned no response, stopping")
+            if not uc_resp:
+                print(f"[llm] uncovered-regions revision returned no response, stopping")
                 break
             try:
-                cov_cuts = parse_cuts(cov_resp, max_duration=duration)
+                uc_cuts = parse_cuts(uc_resp, max_duration=duration)
             except Exception as e:
-                print(f"[llm] couldn't parse coverage revision: {e}, stopping")
+                print(f"[llm] couldn't parse uncovered-regions revision: {e}, stopping")
                 break
-            if not cov_cuts:
-                print(f"[llm] coverage revision returned 0 cuts, stopping")
+            if not uc_cuts:
+                print(f"[llm] uncovered-regions revision returned 0 cuts, stopping")
                 break
-            merged = _union_intervals(list(current_cuts) + list(cov_cuts))
-            new_pct = 100.0 * sum(e - s for s, e in merged) / max(duration, 1e-6)
+            merged = _union_intervals(list(current_cuts) + list(uc_cuts))
             new_added = len(merged) - len(current_cuts)
-            print(f"[llm] coverage merge [iter {cov_iter}]: existing {len(current_cuts)} + "
-                  f"new {len(cov_cuts)} -> {len(merged)} total (+{new_added} net), {new_pct:.1f}% cut")
+            new_pct = 100.0 * sum(e - s for s, e in merged) / max(duration, 1e-6)
+            print(f"[llm] uncovered-regions merge [iter {uc_iter}]: existing "
+                  f"{len(current_cuts)} + new {len(uc_cuts)} -> {len(merged)} total "
+                  f"(+{new_added} net), {new_pct:.1f}% cut")
             if new_added == 0:
-                # Revision overlapped entirely with existing — no progress.
-                print(f"[llm] coverage revision contributed no net-new cuts, stopping")
+                print(f"[llm] uncovered-regions revision contributed no net-new cuts, stopping")
                 break
-            coverage_resp = cov_resp  # last successful revision
+            uncovered_resp = uc_resp  # last successful raw response (for cache)
             current_cuts = merged
             final_resp = _format_cuts_block(merged)
     except Exception as e:
@@ -1172,6 +1275,7 @@ def detect_cuts(
         "structure_response": structure_resp,
         "revised_response": revised_resp,
         "coverage_response": coverage_resp,
+        "uncovered_response": uncovered_resp,
         "final_response": final_resp if final_resp is not primary_resp else None,
         "cut_pct_first": cut_pct_first,
         "cut_pct_revised": cut_pct_revised,
