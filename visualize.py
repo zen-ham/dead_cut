@@ -650,12 +650,256 @@ def _find_summary(out_dir):
     return _load_if(candidates[-1])
 
 
+# ---------------------------------------------------------------------------
+# Iter-vs-iter diff visualization
+# ---------------------------------------------------------------------------
+
+# Diff palette — distinct from the main viz palette so the two PNGs don't
+# look confusingly similar.
+DIFF_COLORS = {
+    "common":   "#3fb950",  # green — kept by both
+    "only_a":   "#58a6ff",  # blue — kept only by iter A
+    "only_b":   "#fb8500",  # orange — kept only by iter B
+}
+
+
+def _interval_diff(a_intervals, b_intervals, duration):
+    """Classify the source timeline [0, duration] into three non-overlapping
+    interval lists: common (kept by both), only_a (kept by A but cut by B),
+    only_b (kept by B but cut by A). Implementation: boundary sweep — collect
+    all endpoints, walk consecutive pairs, classify each by midpoint
+    membership."""
+    if duration <= 0:
+        return [], [], []
+    boundaries = {0.0, float(duration)}
+    for s, e in (a_intervals or []):
+        boundaries.add(float(s))
+        boundaries.add(float(e))
+    for s, e in (b_intervals or []):
+        boundaries.add(float(s))
+        boundaries.add(float(e))
+    pts = sorted(b for b in boundaries if 0.0 <= b <= duration)
+
+    def _in(intervals, t):
+        for s, e in intervals or []:
+            if s <= t < e:
+                return True
+        return False
+
+    common, only_a, only_b = [], [], []
+    for i in range(len(pts) - 1):
+        s, e = pts[i], pts[i + 1]
+        if e - s < 1e-6:
+            continue
+        mid = (s + e) / 2.0
+        in_a = _in(a_intervals, mid)
+        in_b = _in(b_intervals, mid)
+        if in_a and in_b:
+            common.append((s, e))
+        elif in_a:
+            only_a.append((s, e))
+        elif in_b:
+            only_b.append((s, e))
+
+    def _merge(lst):
+        if not lst:
+            return []
+        lst = sorted(lst)
+        out = [list(lst[0])]
+        for s, e in lst[1:]:
+            if s <= out[-1][1] + 1e-6:
+                out[-1][1] = max(out[-1][1], e)
+            else:
+                out.append([s, e])
+        return [(s, e) for s, e in out]
+
+    return _merge(common), _merge(only_a), _merge(only_b)
+
+
+def _load_iter_summary(out_dir, iteration):
+    """Load summary_iter{N}.json. Returns None if missing."""
+    return _load_if(os.path.join(out_dir, f"summary_iter{iteration}.json"))
+
+
+def _load_iter_llm(out_dir, iteration):
+    """Load llm_iter{N}.json. Returns None if missing."""
+    return _load_if(os.path.join(out_dir, f"llm_iter{iteration}.json"))
+
+
+def render_diff(
+    video_id: str, iter_a: int, iter_b: int, out_path: str | None = None,
+) -> str | None:
+    """Render a PNG comparing two iterations of the LLM cut for the same
+    video. Shows each iter's keep timeline, a combined diff timeline, and
+    a stats block comparing model / cut count / quality side-by-side.
+
+    Output filename: pipeline_diff_iter{A}_vs_iter{B}.png in the cache dir.
+    Returns the path, or None if either iter's summary is missing.
+    """
+    out_dir = cache_dir(video_id)
+    sum_a = _load_iter_summary(out_dir, iter_a)
+    sum_b = _load_iter_summary(out_dir, iter_b)
+    if not sum_a or not sum_b:
+        missing = [f"iter{n}" for n, s in [(iter_a, sum_a), (iter_b, sum_b)] if not s]
+        print(f"[visualize] cannot diff — missing summary for: {', '.join(missing)}")
+        return None
+
+    duration = float(sum_a.get("original_duration_s")
+                     or sum_b.get("original_duration_s") or 0)
+    if duration <= 0:
+        print(f"[visualize] no duration info; cannot diff")
+        return None
+
+    keeps_a = [tuple(k) for k in (sum_a.get("keep_ranges") or [])]
+    keeps_b = [tuple(k) for k in (sum_b.get("keep_ranges") or [])]
+    common, only_a, only_b = _interval_diff(keeps_a, keeps_b, duration)
+
+    # Per-iter quality on AI cuts (use cut_ranges, mirroring the main viz).
+    llm_a = _load_iter_llm(out_dir, iter_a) or {}
+    llm_b = _load_iter_llm(out_dir, iter_b) or {}
+    target_a = {"floor_pct": llm_a.get("target_floor_pct", 0),
+                "ceiling_pct": llm_a.get("target_ceiling_pct", 100)}
+    target_b = {"floor_pct": llm_b.get("target_floor_pct", 0),
+                "ceiling_pct": llm_b.get("target_ceiling_pct", 100)}
+    cuts_a = [tuple(c) for c in (sum_a.get("cut_ranges") or [])]
+    cuts_b = [tuple(c) for c in (sum_b.get("cut_ranges") or [])]
+    q_a_label, q_a_color, _ = _compute_quality(cuts_a, duration, target_a)
+    q_b_label, q_b_color, _ = _compute_quality(cuts_b, duration, target_b)
+
+    # Layout: header + stats block + 3 timelines + legend.
+    fig_width = 16.0
+    header_h = 0.85
+    stats_h = 1.5
+    timeline_each = 0.55
+    legend_h = 0.45
+    n_timelines = 3
+    fig_height = header_h + stats_h + n_timelines * timeline_each + legend_h + 0.5
+
+    fig = plt.figure(figsize=(fig_width, fig_height), facecolor=COLORS["bg"])
+    gs = fig.add_gridspec(
+        nrows=3 + n_timelines, ncols=1,
+        height_ratios=[header_h, stats_h] + [timeline_each] * n_timelines + [legend_h],
+        hspace=0.55, left=0.10, right=0.985, top=0.96, bottom=0.05,
+    )
+
+    # ----- Header -----
+    ax_h = fig.add_subplot(gs[0])
+    ax_h.axis("off")
+    ax_h.set_facecolor(COLORS["bg"])
+    ax_h.text(0.0, 0.85,
+              f"dead_cut diff — iter {iter_a} vs iter {iter_b}  ({video_id})",
+              fontsize=15, weight="bold", va="top", color=COLORS["text"])
+    common_s = sum(e - s for s, e in common)
+    only_a_s = sum(e - s for s, e in only_a)
+    only_b_s = sum(e - s for s, e in only_b)
+    ax_h.text(0.0, 0.30,
+              f"source: {_hms(duration)}   |   "
+              f"shared keeps: {_hms(common_s)} ({100*common_s/duration:.1f}%)   "
+              f"only iter {iter_a}: {_hms(only_a_s)}   "
+              f"only iter {iter_b}: {_hms(only_b_s)}",
+              fontsize=9, va="top", color=COLORS["text_dim"])
+
+    # ----- Stats comparison block (two side-by-side columns) -----
+    ax_s = fig.add_subplot(gs[1])
+    ax_s.axis("off")
+    ax_s.set_facecolor(COLORS["bg"])
+    ax_s.set_xlim(0, 1)
+    ax_s.set_ylim(0, 1)
+    col_w = 0.48
+    for i, (label, summary, llm, q_label, q_color) in enumerate([
+        (f"iter {iter_a}", sum_a, llm_a, q_a_label, q_a_color),
+        (f"iter {iter_b}", sum_b, llm_b, q_b_label, q_b_color),
+    ]):
+        x = 0.0 if i == 0 else 0.50
+        ax_s.text(x, 0.95, label.upper(), fontsize=11, weight="bold",
+                  color=COLORS["text"], va="top")
+        # Quality badge inline.
+        bw, bh = 0.13, 0.18
+        ax_s.add_patch(Rectangle((x + 0.10, 0.78), bw, bh,
+                                  facecolor=q_color, edgecolor="none", alpha=0.9))
+        ax_s.text(x + 0.10 + bw / 2, 0.78 + bh / 2, q_label,
+                  fontsize=9, weight="bold", ha="center", va="center",
+                  color=COLORS["bg"])
+        model = (llm.get("model") or "?").split("/")[-1].split(":")[0]
+        keep_s = summary.get("keep_total_s") or 0
+        pct_kept = 100.0 * keep_s / max(duration, 1e-6)
+        lines = [
+            f"model:       {model}",
+            f"AI cuts:     {summary.get('n_cuts', 0)}  "
+            f"({summary.get('pct_cut', 0):.1f}% of source)",
+            f"sub-keeps:   {summary.get('n_sub_keeps', 0)}",
+            f"final kept:  {_hms(keep_s)}  ({pct_kept:.1f}%)",
+            f"elapsed:     {_fmt_secs(summary.get('elapsed_s'))}",
+        ]
+        for j, ln in enumerate(lines):
+            ax_s.text(x, 0.70 - j * 0.13, ln, fontsize=9,
+                      color=COLORS["text"], va="top", family="monospace")
+
+    # ----- Timeline rows -----
+    # Row 1: iter A keeps (full-row blue bars)
+    ax1 = fig.add_subplot(gs[2])
+    _draw_intervals(ax1, keeps_a, duration, DIFF_COLORS["only_a"], alpha=0.85)
+    _strip_axis(ax1, duration, f"iter {iter_a}\nkeeps")
+    ax1.text(0.998, 0.5, f"n={len(keeps_a)}", ha="right", va="center",
+             transform=ax1.transAxes, fontsize=7, color=COLORS["text_dim"])
+
+    # Row 2: iter B keeps (full-row orange bars)
+    ax2 = fig.add_subplot(gs[3])
+    _draw_intervals(ax2, keeps_b, duration, DIFF_COLORS["only_b"], alpha=0.85)
+    _strip_axis(ax2, duration, f"iter {iter_b}\nkeeps")
+    ax2.text(0.998, 0.5, f"n={len(keeps_b)}", ha="right", va="center",
+             transform=ax2.transAxes, fontsize=7, color=COLORS["text_dim"])
+
+    # Row 3: combined diff — color-coded common/only_a/only_b on one axis.
+    ax3 = fig.add_subplot(gs[4])
+    _draw_intervals(ax3, common, duration, DIFF_COLORS["common"], alpha=0.95)
+    _draw_intervals(ax3, only_a, duration, DIFF_COLORS["only_a"], alpha=0.95)
+    _draw_intervals(ax3, only_b, duration, DIFF_COLORS["only_b"], alpha=0.95)
+    _strip_axis(ax3, duration, "diff\n(combined)")
+
+    # ----- Legend -----
+    ax_l = fig.add_subplot(gs[5])
+    ax_l.axis("off")
+    ax_l.set_facecolor(COLORS["bg"])
+    ax_l.set_xlim(0, 1)
+    ax_l.set_ylim(0, 1)
+    leg_items = [
+        (f"kept by both ({_hms(common_s)})",     DIFF_COLORS["common"]),
+        (f"only iter {iter_a} ({_hms(only_a_s)})", DIFF_COLORS["only_a"]),
+        (f"only iter {iter_b} ({_hms(only_b_s)})", DIFF_COLORS["only_b"]),
+    ]
+    lx = 0.0
+    for label, c in leg_items:
+        ax_l.add_patch(Rectangle((lx, 0.4), 0.015, 0.32,
+                                  facecolor=c, edgecolor="none"))
+        ax_l.text(lx + 0.022, 0.56, label, fontsize=9, va="center",
+                  color=COLORS["text"])
+        lx += 0.27
+
+    if out_path is None:
+        out_path = os.path.join(
+            out_dir, f"pipeline_diff_iter{iter_a}_vs_iter{iter_b}.png"
+        )
+    fig.savefig(out_path, dpi=120, bbox_inches="tight",
+                facecolor=COLORS["bg"], edgecolor="none")
+    plt.close(fig)
+    return out_path
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("video_id")
     ap.add_argument("-o", "--output", default=None)
+    ap.add_argument("--diff", nargs=2, metavar=("ITER_A", "ITER_B"), type=int,
+                    help="Render a diff PNG comparing two iterations of the LLM"
+                         " cut for this video, instead of the standard pipeline"
+                         " visual.")
     args = ap.parse_args()
-    path = render(args.video_id, out_path=args.output)
+    if args.diff:
+        path = render_diff(args.video_id, args.diff[0], args.diff[1],
+                           out_path=args.output)
+    else:
+        path = render(args.video_id, out_path=args.output)
     if path:
         print(f"[visualize] wrote {path}")
     else:
