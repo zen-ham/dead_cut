@@ -22,12 +22,12 @@ Most of these videos are gaming streams, podcasts, or commentary — the \
 entertainment is the streamer's reactions, jokes, distinctive personality \
 moments, hype reactions, storytelling, AND dry / sarcastic / deadpan humor.
 
-YOU MUST CUT AT LEAST 50% OF THE VIDEO. The user is editing a long vod \
-down to a tight watch; under-cutting (keeping >50%) is failure. If your \
-cuts add up to under 50% of the runtime, you have not done the job — go \
-through the transcript again and find more boring stretches. Most lightly-\
-edited vods have plenty to remove; if you can't find 50% to cut, you're \
-not looking hard enough.
+Each video has a specific TARGET % to cut, given at the top of the user \
+prompt. The target is calibrated for the video's length — longer videos \
+need more cut. Hit the target band; under-cutting means you missed boring \
+stretches, over-cutting means you're block-chunking instead of finding \
+specific dead air. The user prompt also tells you the floor and ceiling, \
+treat those as hard limits.
 
 WHAT TO CUT (most of the video):
 
@@ -108,9 +108,11 @@ as 2.5hr). Use any consistent dash character.
 6. Each cut should be at least ~15 seconds. Sub-10s micro-cuts feel twitchy \
 without saving meaningful time. Let the algo handle inner silence trimming.
 
-7. Don't cut more than 75% of the runtime. If you're tempted to cut more, you \
-probably are over-applying boring labels to mid-energy content that should \
-stay. Aim for cuts totaling 30-60% of runtime.
+7. Stay within the floor and ceiling % given in the user prompt header. \
+Under-cutting (below floor) means you missed boring stretches and a \
+revision pass will fire. Over-cutting (above ceiling) means you're \
+block-chunking instead of identifying specific dead air, and the \
+programmatic safety net will drop your longest cuts.
 
 8. The CUTS_END line must be the last thing in your response. Nothing after.
 
@@ -122,9 +124,20 @@ dead air — usually worth cutting.
 
 
 USER_PROMPT_HEADER = """Video duration: {duration_str} ({duration_sec:.0f} seconds)
-Cut at LEAST 50% (target 50-75%). Output below 50% cut WILL be rejected — the \
-user wants tight edits. Stay under 75% to keep enough content for it to flow. \
-For this video specifically, aim to cut between {min_cut_str} and {max_cut_str}.
+
+TARGET: cut {target_pct}% of this video (≈ {target_cut_str}).
+FLOOR: {floor_pct}% (≈ {floor_cut_str}) — below this triggers a revision pass.
+CEILING: {ceiling_pct}% (≈ {ceiling_cut_str}) — above this triggers safety-net drops.
+
+The target is dynamic, calibrated for this video's length on a log curve: \
+30 min videos go to ~50% cut, 5 hour videos go to ~60% cut. Longer videos \
+have more dead air per entertaining minute, so cut more on long ones.
+
+After your cuts apply, a separate silence-trim stage will automatically \
+remove an additional ~{est_silence_trim_pct}% of inner dead air from the \
+keep regions (silences > 0.6s get compressed). So you don't need to flag \
+short inter-sentence pauses — only the MACRO boring stretches. Focus on \
+sections you'd skip past if watching at 2x.
 
 EXPECTED CUT COUNT for a video this length: aim for {cut_target_low}-{cut_target_high} \
 distinct cut ranges. Fewer than {cut_target_low_strict} means you're being lazy. \
@@ -154,19 +167,33 @@ def _hms(t: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def build_user_prompt(duration: float, segments: list, loudness_per_seg: list) -> str:
-    # 50% MIN cut, 75% MAX cut.
-    min_cut_sec = duration * 0.50
-    max_cut_sec = duration * 0.75
+def build_user_prompt(
+    duration: float,
+    segments: list,
+    loudness_per_seg: list,
+    target: dict,
+) -> str:
+    """Render the user prompt with a per-video target dict from target.py."""
     duration_min = duration / 60.0
-    cut_target_low = max(5, int(round(duration_min * 0.25)))   # longer cuts now
+    cut_target_low = max(5, int(round(duration_min * 0.25)))
     cut_target_high = max(10, int(round(duration_min * 0.5)))
     cut_target_low_strict = max(3, int(round(duration_min * 0.15)))
+    # Silence trim removes silence in keeps, so the ratio relative to source
+    # is roughly (whole-video trim ratio) * (ai keep ratio). Show the model
+    # the per-source estimate so it understands the help it's getting.
+    silence_ratio_total = float(target.get("silence_trim_ratio", 0.0))
+    ai_keep_frac = max(0.05, 1.0 - target["ai_cut_pct"] / 100.0)
+    est_silence_trim_pct = round(100.0 * silence_ratio_total * ai_keep_frac)
     header = USER_PROMPT_HEADER.format(
         duration_str=_hms(duration),
         duration_sec=duration,
-        min_cut_str=_hms(min_cut_sec),
-        max_cut_str=_hms(max_cut_sec),
+        target_pct=target["ai_cut_pct"],
+        floor_pct=target["floor_pct"],
+        ceiling_pct=target["ceiling_pct"],
+        target_cut_str=_hms(duration * target["ai_cut_pct"] / 100.0),
+        floor_cut_str=_hms(duration * target["floor_pct"] / 100.0),
+        ceiling_cut_str=_hms(duration * target["ceiling_pct"] / 100.0),
+        est_silence_trim_pct=est_silence_trim_pct,
         cut_target_low=cut_target_low,
         cut_target_high=cut_target_high,
         cut_target_low_strict=cut_target_low_strict,

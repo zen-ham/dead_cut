@@ -52,16 +52,20 @@ def transcribe(
 
     pipeline = _get_pipeline(model_name)
     print(f"[transcribe] running on {video_path} (batch={batch_size})")
+    # word_timestamps=True asks whisper for per-word start/end. Adds a small
+    # alignment pass per segment but gives us a fine-grained speech map —
+    # essential for catching natural inter-word pauses (which are the bulk
+    # of "no-speech" time in long monologues). Without this, segments are
+    # multi-sentence VAD chunks and inter-segment gaps are rare.
     segments_iter, info = pipeline.transcribe(
         video_path,
         batch_size=batch_size,
         beam_size=5,
         vad_filter=True,
         vad_parameters={"min_silence_duration_ms": 500},
+        word_timestamps=True,
     )
     segments = []
-    # tqdm: drive progress by audio-time-covered vs total duration, since we
-    # know info.duration up front and segments come in chronological order.
     pbar = tqdm(
         total=float(info.duration), unit="s", desc="[stage   ] transcribe",
         bar_format="{desc} {bar} {percentage:3.0f}% | {n:.0f}/{total:.0f}s | eta {remaining}",
@@ -69,15 +73,25 @@ def transcribe(
     )
     prev_end = 0.0
     for s in segments_iter:
+        words = []
+        if getattr(s, "words", None):
+            for w in s.words:
+                if w.start is None or w.end is None:
+                    continue
+                words.append({
+                    "start": round(float(w.start), 3),
+                    "end": round(float(w.end), 3),
+                    "word": w.word,
+                })
         segments.append({
             "start": round(s.start, 3),
             "end": round(s.end, 3),
             "text": s.text.strip(),
+            "words": words,
         })
         delta = max(0.0, s.end - prev_end)
         pbar.update(delta)
         prev_end = s.end
-        # Report observed transcribe pace for overall ETA.
         progress.report_stage_rate("transcribe", s.end / max(info.duration, 1))
         progress.tick()
     # Snap to 100% in case the last segment ended slightly short of info.duration.

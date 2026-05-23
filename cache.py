@@ -34,7 +34,46 @@ def cache_dir(video_id: str) -> str:
     d = os.path.join(CACHE_ROOT, video_id)
     os.makedirs(d, exist_ok=True)
     _migrate_legacy_names(d)
+    _ensure_undo_bats(d)
     return d
+
+
+# Stage -> list of files to delete when the user double-clicks that .bat.
+# Each value is a list of literal filenames or `del`-compatible glob patterns.
+_UNDO_BATS = {
+    "download":   ["vid_src.mp4"],
+    "transcribe": ["transcribe.json"],
+    "loudness":   ["loudness.json", "loudness_audio.wav"],
+    "llm":        ["llm_iter*.json"],
+    "encode":     ["final.mp4", "summary_iter*.json"],
+    "all": [
+        "vid_src.mp4", "transcribe.json", "loudness.json", "loudness_audio.wav",
+        "final.mp4", "llm_iter*.json", "summary_iter*.json", "cutter_*",
+    ],
+}
+
+
+def _ensure_undo_bats(cache_dir_path: str) -> None:
+    """Drop one-click undo .bat files into each cache folder. Each script
+    chdir's to its own directory and deletes the files for a single pipeline
+    stage, so the user can selectively re-run that stage by double-clicking
+    the script. Always overwrites so template updates propagate."""
+    for stage, patterns in _UNDO_BATS.items():
+        bat_path = os.path.join(cache_dir_path, f"undo_{stage}.bat")
+        # cmd.exe's `del` globs unquoted patterns. No spaces in our names,
+        # so dropping the quotes keeps llm_iter*.json / cutter_* expanding.
+        del_lines = "\r\n".join(f"del /q {p} 2>nul" for p in patterns)
+        content = (
+            "@echo off\r\n"
+            'cd /d "%~dp0"\r\n'
+            f"echo Undoing {stage} stage in %CD%...\r\n"
+            f"{del_lines}\r\n"
+        )
+        try:
+            with open(bat_path, "w", encoding="ascii", newline="") as f:
+                f.write(content)
+        except OSError:
+            pass  # don't crash the pipeline if write fails
 
 
 # Rename map: old cache filenames -> new (stage-prefixed) names.

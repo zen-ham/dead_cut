@@ -198,6 +198,59 @@ def trim_silences_within_keeps(
     return new_keeps
 
 
+def merge_close_keeps(
+    keeps: List[Tuple[float, float]],
+    segments: List[dict],
+    max_gap_s: float = 1.5,
+) -> Tuple[List[Tuple[float, float]], int, float]:
+    """Merge adjacent sub-keeps separated by a short, speechless gap.
+
+    After silence trim creates many short skips between sub-keeps, some of
+    those skips are tiny dead-air slivers (0.2-1.5s) with no speech in
+    them. Cutting on those produces choppy flashes. If the gap is short
+    AND no transcript segment overlaps it, we can safely absorb the skip
+    back into a single contiguous keep.
+
+    A segment overlapping the gap means the transcript thinks someone is
+    talking there — never merge across speech, that would drop dialogue.
+
+    Returns:
+        (new_keeps, n_merged, total_gap_absorbed_s)
+    """
+    if len(keeps) < 2:
+        return keeps, 0, 0.0
+    # Segments sorted by start for fast overlap check.
+    seg_sorted = sorted(((s["start"], s["end"]) for s in segments), key=lambda x: x[0])
+    seg_starts = [s[0] for s in seg_sorted]
+
+    def speech_in(gap_start: float, gap_end: float) -> bool:
+        if not seg_sorted:
+            return False
+        # First segment whose start >= gap_start, then walk back one to catch
+        # a segment that starts before but extends into the gap.
+        i = bisect.bisect_left(seg_starts, gap_start)
+        for j in (i - 1, i):
+            if 0 <= j < len(seg_sorted):
+                ss, se = seg_sorted[j]
+                if se > gap_start and ss < gap_end:
+                    return True
+        return False
+
+    merged: List[Tuple[float, float]] = [keeps[0]]
+    n_merged = 0
+    absorbed_s = 0.0
+    for ks, ke in keeps[1:]:
+        prev_s, prev_e = merged[-1]
+        gap = ks - prev_e
+        if 0 < gap <= max_gap_s and not speech_in(prev_e, ks):
+            merged[-1] = (prev_s, ke)
+            n_merged += 1
+            absorbed_s += gap
+        else:
+            merged.append((ks, ke))
+    return merged, n_merged, absorbed_s
+
+
 def merge_close_cuts(
     cuts: List[Tuple[float, float]],
     max_gap_s: float = 5.0,

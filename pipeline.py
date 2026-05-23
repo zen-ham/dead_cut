@@ -8,10 +8,11 @@ from .download import download, fetch_duration
 from .transcribe import transcribe
 from .loudness import analyze as analyze_loudness
 from .llm import detect_cuts
+from .target import compute_ai_cut_target, estimate_silence_trim_ratio
 from .parser import (
     parse_cuts, cuts_to_keeps, snap_cuts_to_silence, trim_silences_within_keeps,
     enforce_budget, extract_highlights_from_response, protect_highlights,
-    merge_close_cuts,
+    merge_close_cuts, merge_close_keeps,
 )
 from .cutter import cut_video
 from . import progress
@@ -25,7 +26,13 @@ SNAP_TOLERANCE_S = 2.0
 # Within-keep silence trim. The LLM does macro cuts well but can't see fine
 # dead air between sentences — these compress long silences to a small gap.
 TRIM_MAX_SILENCE_S = 0.6
-TRIM_PADDING_S = 0.2
+TRIM_PADDING_S = 0.15
+
+# Post-trim merge: after silence trim creates many short skips between
+# sub-keeps, absorb any skip ≤ this duration that contains no transcript
+# speech. Re-flows micro-cuts back into longer takes so playback is less
+# choppy without losing actual dialogue.
+KEEP_MERGE_MAX_GAP_S = 1.5
 
 
 def _ffprobe_duration(path: str) -> float:
@@ -42,6 +49,31 @@ def _hms(t: float) -> str:
     h, rem = divmod(t, 3600)
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _elapsed_fmt(t: float) -> str:
+    if t < 60:
+        return f"{t:.1f}s"
+    m, s = divmod(int(round(t)), 60)
+    return f"{m}m {s}s"
+
+
+def _announce_cached_stages(out_dir: str, iteration: int) -> None:
+    """Peek at the cache before any stage runs and shrink the baseline for
+    each stage whose output is already on disk. Without this, the overall ETA
+    starts assuming a full download+transcribe+loudness even when re-running
+    `--iter N` on a fully-cached video (mostly LLM work). 0.3s is realistic
+    for a json/path cache hit."""
+    CACHED = 0.3
+    checks = {
+        "download":   "vid_src.mp4",
+        "transcribe": "transcribe.json",
+        "loudness":   "loudness.json",
+        "llm":        f"llm_iter{iteration}.json",
+    }
+    for stage, filename in checks.items():
+        if os.path.exists(os.path.join(out_dir, filename)):
+            progress.set_stage_baseline(stage, CACHED)
 
 
 def _print_cut_stats(n_cuts: int, duration_s: float) -> None:
@@ -104,6 +136,7 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
     if src_dur_pre:
         print(f"[pipeline] source ~{src_dur_pre/60.0:.1f} min\n")
     progress.init(src_dur_pre)
+    _announce_cached_stages(out_dir, iteration)
 
     # 1. Download
     progress.begin_stage("download")
@@ -131,10 +164,23 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
     progress.end_stage("loudness")
     loud_per_seg = loud["per_segment"]
 
-    # 4. LLM cut detection
+    # 4. LLM cut detection. Dynamic cut target: longer videos go to a smaller
+    # final length on a log curve, back-calculated to an AI cut % using the
+    # estimated silence-trim ratio so the model only has to cut what's left
+    # over the trim's contribution. Curve + math in target.py.
+    silence_trim_ratio = estimate_silence_trim_ratio(
+        loud.get("silences", []), duration,
+        max_silence_s=TRIM_MAX_SILENCE_S, padding_s=TRIM_PADDING_S,
+    )
+    target = compute_ai_cut_target(duration, silence_trim_ratio)
+    print(f"[pipeline] dynamic target: cut {target['ai_cut_pct']}% "
+          f"(floor {target['floor_pct']}%, ceiling {target['ceiling_pct']}%), "
+          f"final keep target {target['target_final_keep_pct']}%, "
+          f"silence-trim assist ≈ {silence_trim_ratio*100:.1f}%")
     progress.begin_stage("llm")
     model, raw, primary_raw = detect_cuts(vid, duration, segments, loud_per_seg,
-                                          iteration=iteration, force_model=force_model)
+                                          target=target, iteration=iteration,
+                                          force_model=force_model)
     progress.end_stage("llm")
 
     # 5. Parse + snap-to-silence + invert.
@@ -143,7 +189,32 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
     # then we round each boundary to the nearest detected silence within
     # SNAP_TOLERANCE_S. Disable with snap=False to compare A/B.
     progress.begin_stage("post")
-    cuts_raw = parse_cuts(raw, max_duration=duration)
+    try:
+        cuts_raw = parse_cuts(raw, max_duration=duration)
+    except ValueError as e:
+        progress.end_stage("post")
+        progress.close()
+        bar = "!" * 80
+        print()
+        print(bar)
+        print(f"!! [FATAL] LLM did not produce a usable CUTS block")
+        print("!!")
+        print(f"!! Error: {e}")
+        print("!!")
+        print(f"!! detect_cuts already retried once with a corrective message")
+        print(f"!! but the model still didn't emit CUTS_BEGIN..CUTS_END. This")
+        print(f"!! is most common on very long vods (8h+) where the model")
+        print(f"!! exhausts its planning before reaching the cut list, or on")
+        print(f"!! degenerate samples that veer into other text formats.")
+        print("!!")
+        print(f"!! Try:")
+        print(f"!!   - rerun with --iter N to get a different sample")
+        print(f"!!   - rerun with --model qwen/qwen3.6-plus:free to try a")
+        print(f"!!     different model")
+        print(f"!!   - for very long vods, consider trimming the source first")
+        print(bar)
+        print()
+        raise SystemExit(1)
 
     # Protect highlights programmatically: the model commits to a HIGHLIGHTS
     # list (entertaining moments to keep) but empirically can contradict it
@@ -183,13 +254,13 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
     # 75% budget, drop the longest cuts programmatically. This runs even when
     # detect_cuts already triggered a revision — that's intentional: it only
     # trims if STILL over budget after revision.
-    cuts_raw, was_trimmed = enforce_budget(cuts_raw, duration, ceiling_frac=0.75)
+    cuts_raw, was_trimmed = enforce_budget(cuts_raw, duration, ceiling_frac=target["ceiling_pct"] / 100.0)
     if was_trimmed:
         new_total = sum(e - s for s, e in cuts_raw)
         new_pct = 100.0 * new_total / max(duration, 1e-6)
         print(
             f"\n[WARNING] programmatic drop applied — LLM still over budget after "
-            f"revision. Trimmed to {len(cuts_raw)} cuts ({new_pct:.1f}% of source). "
+            f"revision. Trimmed to {len(cuts_raw)} cuts ({new_pct:.1f}% cut). "
             f"This is the safety net firing because the model couldn't self-correct.\n"
         )
 
@@ -206,9 +277,9 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
     cut_secs = sum(e - s for s, e in cuts)
     keep_secs_pre = sum(e - s for s, e in keeps_pre_trim)
     pct_cut = 100.0 * cut_secs / max(duration, 1e-6)
-    print(f"[pipeline] {len(cuts)} cuts totalling {cut_secs:.1f}s ({pct_cut:.1f}% of {duration:.1f}s)")
+    print(f"[pipeline] {len(cuts)} cuts totalling {cut_secs:.1f}s ({pct_cut:.1f}% cut of {duration:.1f}s)")
     print(f"[pipeline] expected length after AI cuts: {_hms(keep_secs_pre)} "
-          f"(was {_hms(duration)}, {100*keep_secs_pre/duration:.1f}% kept)")
+          f"(was {_hms(duration)}, {100*(1-keep_secs_pre/duration):.1f}% cut)")
 
     # 5b. Within-keep silence trim. The LLM sees segment-level loudness summary
     # so it can't catch the 15s walking-around silences between two spoken
@@ -226,15 +297,29 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
         keeps = keeps_pre_trim
         if trim:
             print("[pipeline] trim enabled but no silences in loudness cache — skipped")
+
+    # 5c. Absorb micro-skips back into bigger keeps when the gap is short
+    # and contains no transcript speech. Silence trim is per-silence so
+    # successive long silences create stacked tiny sub-keeps; this re-flows
+    # those into single takes so playback isn't choppy.
+    keeps_pre_merge = keeps
+    keeps, n_merged_keeps, absorbed_s = merge_close_keeps(
+        keeps, segments, max_gap_s=KEEP_MERGE_MAX_GAP_S,
+    )
+    if n_merged_keeps:
+        print(f"[pipeline] merged {n_merged_keeps} adjacent sub-keep(s) "
+              f"(gap ≤{KEEP_MERGE_MAX_GAP_S}s, no speech in gap) "
+              f"-> {len(keeps)} sub-keeps, absorbed {absorbed_s:.1f}s of dead air "
+              f"back into takes")
     keep_secs = sum(e - s for s, e in keeps)
     if trim and keep_secs != keep_secs_pre:
         print(f"[pipeline] expected length after silence trim: {_hms(keep_secs)} "
-              f"(was {_hms(duration)}, {100*keep_secs/duration:.1f}% kept)")
+              f"(was {_hms(duration)}, {100*(1-keep_secs/duration):.1f}% cut)")
     progress.end_stage("post")
 
-    # 6. Cut. Per-iter file for debugging; also copy to final.mp4 as the
-    # canonical "latest" output.
-    final_path = os.path.join(out_dir, f"final_iter{iteration}.mp4")
+    # 6. Cut. One canonical output file, overwritten on each --iter rerun.
+    # Per-iter debugging context lives in summary_iter{N}.json beside it.
+    final_path = os.path.join(out_dir, "final.mp4")
     if dry_run:
         print("[pipeline] DRY RUN — skipping ffmpeg cut")
     else:
@@ -246,17 +331,6 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
         progress.begin_stage("encode")
         cut_video(video_path, keeps, final_path, work_dir=out_dir)
         progress.end_stage("encode")
-        # Hard-link `final.mp4` -> `final_iter{N}.mp4` instead of copying.
-        # Same inode, no extra disk. Deleting either leaves the other intact.
-        # Falls back to copy if hardlinks aren't supported (cross-fs etc).
-        canonical = os.path.join(out_dir, "final.mp4")
-        if os.path.exists(canonical):
-            os.remove(canonical)
-        try:
-            os.link(final_path, canonical)
-        except OSError:
-            import shutil
-            shutil.copyfile(final_path, canonical)
 
     progress.close()
 
@@ -286,7 +360,8 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
 
     # End-of-run summary block: before/after timings + cut counts now that
     # we know the actual trimmed output size. Print after `[pipeline] DONE`.
-    pct_kept = 100.0 * keep_secs / max(duration, 1e-6)
+    pct_cut_total = 100.0 * (1 - keep_secs / max(duration, 1e-6))
+    pct_cut_after_ai = 100.0 * (1 - keep_secs_pre / max(duration, 1e-6))
     ai_removed = max(0.0, duration - keep_secs_pre)
     silence_removed = max(0.0, keep_secs_pre - keep_secs)
     # Each silence removed inside a keep splits 1 keep into 2 sub-keeps,
@@ -296,11 +371,11 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
     print(f"  [final summary]")
     print(f"    source duration:       {_hms(duration)}")
     print(f"    AI macro cuts:         {len(cuts)}  (removed {_hms(ai_removed)})")
-    print(f"    after AI cuts:         {_hms(keep_secs_pre)}  ({100*keep_secs_pre/duration:.1f}% of source)")
+    print(f"    after AI cuts:         {_hms(keep_secs_pre)}  ({pct_cut_after_ai:.1f}% cut)")
     print(f"    silence micro-cuts:    {silence_cut_count}  (removed {_hms(silence_removed)})")
-    print(f"    after silence trim:    {_hms(keep_secs)}  ({pct_kept:.1f}% of source)")
-    print(f"    total removed:         {_hms(duration-keep_secs)}  ({100-pct_kept:.1f}%)")
+    print(f"    after silence trim:    {_hms(keep_secs)}  ({pct_cut_total:.1f}% cut)")
+    print(f"    total cut:             {_hms(duration-keep_secs)}  ({pct_cut_total:.1f}%)")
     print(f"    output:                {final_path}")
-    print(f"    elapsed:               {summary['elapsed_s']}s")
+    print(f"    elapsed:               {_elapsed_fmt(summary['elapsed_s'])}")
     print()
     return summary
