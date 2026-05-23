@@ -40,32 +40,86 @@ def cut_video(
     output_path: str,
     work_dir: str,
 ) -> None:
-    """Write a new mp4 containing only the keep_ranges from source_path."""
+    """Write a new mp4 containing only the keep_ranges from source_path.
+
+    Atomicity: writes to <output_path>.partial first, only renames to the
+    final name on success. Prevents a corrupt half-mp4 if the process is
+    killed mid-encode. Also drops an encode_checkpoint.json before starting
+    so an interrupted run is detectable on next launch."""
     if not keep_ranges:
         raise ValueError("No keep_ranges given — would produce empty video")
+
+    import json as _json
+    import time as _time
+    checkpoint_path = os.path.join(work_dir, "encode_checkpoint.json")
+    # Preserve the .mp4 extension on the partial file so ffmpeg can infer the
+    # container format. `final.mp4.partial` makes ffmpeg fail with "Unable to
+    # choose an output format". `final.partial.mp4` keeps mp4 inference and
+    # still sorts/greps obviously as a partial.
+    _base, _ext = os.path.splitext(output_path)
+    partial_path = f"{_base}.partial{_ext}"
+
+    # If a previous run was interrupted, log it and clear the leftover.
+    if os.path.exists(checkpoint_path):
+        try:
+            ck = _json.load(open(checkpoint_path, encoding="utf-8"))
+            print(f"[cutter] previous encode interrupted at "
+                  f"{ck.get('started_at_iso', '?')} — clearing partial state")
+        except Exception:
+            pass
+        if os.path.exists(partial_path):
+            try:
+                os.remove(partial_path)
+            except OSError:
+                pass
+        try:
+            os.remove(checkpoint_path)
+        except OSError:
+            pass
+
+    # Drop checkpoint so we can detect interrupt next time.
+    with open(checkpoint_path, "w", encoding="utf-8") as f:
+        _json.dump({
+            "started_at": _time.time(),
+            "started_at_iso": _time.strftime("%Y-%m-%d %H:%M:%S"),
+            "n_keep_ranges": len(keep_ranges),
+            "output_path": output_path,
+            "partial_path": partial_path,
+        }, f, indent=2)
 
     need_reencode = (
         len(keep_ranges) > REENCODE_SEG_COUNT
         or any(e - s < REENCODE_MIN_SEG_S for s, e in keep_ranges)
     )
-    if not need_reencode:
-        _cut_streamcopy(source_path, keep_ranges, output_path, work_dir)
-        return
-
-    # Prefer smartcut+nvenc when the source codec is h264 and nvenc is
-    # available — partial re-encode that benchmarked ~2x faster than the
-    # full-reencode path. Fall through to _cut_reencode on any failure or
-    # for non-h264 sources (smartcut needs matching codec, AV1 has no
-    # boundary-encode GPU support on pre-Ada cards).
-    src_codec = _get_source_video_codec(source_path)
-    if src_codec == "h264" and _has_h264_nvenc():
-        try:
-            _cut_smartcut_nvenc(source_path, keep_ranges, output_path, work_dir)
-            return
-        except Exception as e:
-            print(f"[cutter] smartcut+nvenc failed ({type(e).__name__}: {e}); "
-                  f"falling back to full re-encode")
-    _cut_reencode(source_path, keep_ranges, output_path, work_dir)
+    try:
+        if not need_reencode:
+            _cut_streamcopy(source_path, keep_ranges, partial_path, work_dir)
+        else:
+            # Prefer smartcut+nvenc when the source codec is h264 and nvenc is
+            # available — partial re-encode that benchmarked ~2x faster than the
+            # full-reencode path. Fall through to _cut_reencode on any failure or
+            # for non-h264 sources.
+            src_codec = _get_source_video_codec(source_path)
+            done = False
+            if src_codec == "h264" and _has_h264_nvenc():
+                try:
+                    _cut_smartcut_nvenc(source_path, keep_ranges, partial_path, work_dir)
+                    done = True
+                except Exception as e:
+                    print(f"[cutter] smartcut+nvenc failed ({type(e).__name__}: {e}); "
+                          f"falling back to full re-encode")
+            if not done:
+                _cut_reencode(source_path, keep_ranges, partial_path, work_dir)
+        # Atomic rename .partial → final, then drop checkpoint.
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        os.rename(partial_path, output_path)
+    finally:
+        if os.path.exists(checkpoint_path):
+            try:
+                os.remove(checkpoint_path)
+            except OSError:
+                pass
 
 
 def _cut_streamcopy(
