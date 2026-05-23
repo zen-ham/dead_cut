@@ -454,9 +454,12 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
     # highlight markers — all in source seconds.
     try:
         from .export import write_cuts_json
+        # extract_highlights_from_response is module-level imported at the top
+        # of this file; do NOT re-import it locally — Python's scope analysis
+        # would then treat it as a function-local in run() and break the
+        # earlier reference at the post stage (UnboundLocalError).
         _hl = []
         try:
-            from .parser import extract_highlights_from_response
             _hl = extract_highlights_from_response(primary_raw) or []
         except Exception:
             pass
