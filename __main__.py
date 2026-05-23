@@ -12,14 +12,41 @@ for _stream in ("stdout", "stderr"):
         except Exception:
             pass
 
+import glob
+import os
+import re
+
 from .pipeline import run
+from .cache import cache_dir, video_id_from_url
+
+
+def _latest_cached_iter(url: str) -> int:
+    """Return the highest llm_iter{N}.json index already in the cache for
+    this video, or 0 if none found. Used as the default --iter so re-runs
+    pick up the latest cached LLM result instead of always re-running iter 0."""
+    try:
+        vid = video_id_from_url(url)
+    except Exception:
+        return 0
+    out_dir = cache_dir(vid)
+    pattern = os.path.join(out_dir, "llm_iter*.json")
+    files = glob.glob(pattern)
+    if not files:
+        return 0
+    iters = []
+    for f in files:
+        m = re.search(r"llm_iter(\d+)\.json$", f)
+        if m:
+            iters.append(int(m.group(1)))
+    return max(iters) if iters else 0
 
 
 def main():
     ap = argparse.ArgumentParser(description="dead_cut: auto-edit a YouTube vod")
     ap.add_argument("url", help="YouTube video URL or 11-char video ID")
-    ap.add_argument("--iter", type=int, default=0,
-                    help="Iteration number — bumps LLM cache key so the prompt re-runs")
+    ap.add_argument("--iter", type=int, default=None,
+                    help="LLM cache key. Default: latest already-cached iter. "
+                         "Bump to one above the latest to force a fresh LLM call.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Run through LLM but skip ffmpeg cut")
     ap.add_argument("--model", default=None,
@@ -29,6 +56,9 @@ def main():
     ap.add_argument("--no-trim", action="store_true",
                     help="Disable within-keep silence trim (keeps original pacing)")
     args = ap.parse_args()
+    if args.iter is None:
+        args.iter = _latest_cached_iter(args.url)
+        print(f"[main] --iter not specified; using latest cached iter={args.iter}")
     try:
         run(args.url, iteration=args.iter, dry_run=args.dry_run,
             force_model=args.model, snap=not args.no_snap, trim=not args.no_trim)
