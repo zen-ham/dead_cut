@@ -449,6 +449,27 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
     }
     save_json(os.path.join(out_dir, f"summary_iter{iteration}.json"), summary)
 
+    # JSON cut/keep export for external NLEs (DaVinci, Premiere) or post-
+    # processing scripts. Schema: source duration, cut list, keep list,
+    # highlight markers — all in source seconds.
+    try:
+        from .export import write_cuts_json
+        _hl = []
+        try:
+            from .parser import extract_highlights_from_response
+            _hl = extract_highlights_from_response(primary_raw) or []
+        except Exception:
+            pass
+        _cuts_path = write_cuts_json(
+            out_dir, duration_s=duration, cuts=cuts, keeps=keeps,
+            highlights=_hl,
+            metadata={"video_id": vid, "url": url, "model": model,
+                      "iteration": iteration},
+        )
+        print(f"[pipeline] cuts JSON: {_cuts_path}")
+    except Exception as e:
+        print(f"[pipeline] cuts JSON export failed: {e}")
+
     # Visualize: always (re)generate pipeline_visual.png. Reads ALL cached
     # stats + intermediate data files + the freshly-written summary, so it
     # works even when stages were cache-hit and didn't contribute new stats

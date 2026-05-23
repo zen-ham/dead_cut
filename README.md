@@ -9,12 +9,12 @@ Auto Edit Long YouTube Vods Into Tight Cuts of Just the Entertaining Bits.
 
 ---
 
-
 Give this a 27 minute vod and get back a 9 minute cut. 45 minute stream to 11 minutes of the actually entertaining bits. One command, fully hands off, free openrouter model, no api costs at all forever. The whole pipeline runs at ~50-60x realtime on h.264 sources (a 1h25 vod processes end to end in 2m17s on a gtx 1660 ti).
 
 The way it actually does this is a 2 layer system of editing, first the AI does the macro scale edits, depending on video length it can do 100+ edits on the timeline. Then the second phase is the micro edits, algorithmic silence removal makes the video much more engaging and feels exactly like a well edited vod a youtuber would actually put on main channel.
 
--
+Every run drops a `cuts.json` next to `final.mp4` with the source duration, every cut range, every keep range, and highlight markers in source-second timestamps. Import it into DaVinci / Premiere / your own scripts if you want to do something other than (or on top of) the auto-encoded mp4.
+
 Pipeline Technical Details:
 -
 

@@ -46,11 +46,11 @@ _UNDO_BATS = {
     "loudness":   ["loudness.json", "loudness_audio.wav", "loudness_stats.json"],
     "llm":        ["llm_iter*.json", "llm_stats.json"],
     "encode":     ["final.mp4", "summary_iter*.json", "encode_stats.json",
-                   "post_stats.json", "pipeline_visual.png"],
+                   "post_stats.json", "pipeline_visual.png", "cuts.json"],
     "all": [
         "vid_src.mp4", "transcribe.json", "loudness.json", "loudness_audio.wav",
         "final.mp4", "llm_iter*.json", "summary_iter*.json", "cutter_*",
-        "*_stats.json", "pipeline_visual.png",
+        "*_stats.json", "pipeline_visual.png", "cuts.json",
     ],
 }
 
