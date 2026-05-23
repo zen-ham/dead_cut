@@ -38,6 +38,23 @@ def _get_pipeline(name: str, device: str = "auto", compute_type: str = DEFAULT_C
     return _model_cache[key]
 
 
+def prewarm(model_name: str = DEFAULT_MODEL) -> None:
+    """Kick off the whisper model load in a background thread. Caller does
+    NOT need to wait — the next `transcribe()` call will block on the
+    completion if it isn't done. Used by pipeline to overlap model load
+    with the download stage so first-vod warmup doesn't sit idle."""
+    import threading
+    if model_name in {k[0] for k in _model_cache.keys()}:
+        return  # already loaded
+    def _load():
+        try:
+            _get_pipeline(model_name)
+        except Exception as e:
+            print(f"[transcribe] prewarm failed: {e} (transcribe will retry)")
+    t = threading.Thread(target=_load, daemon=True, name="whisper-prewarm")
+    t.start()
+
+
 def transcribe(
     video_path: str,
     video_id: str,

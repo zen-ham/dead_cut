@@ -139,6 +139,16 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
     progress.init(src_dur_pre)
     _announce_cached_stages(out_dir, iteration)
 
+    # Pre-warm faster-whisper in a background thread while the (often slow)
+    # download is happening. The transcribe call will block on completion
+    # if the load isn't done yet, but normally it'll be ready and we skip
+    # the ~5s cold-load delay at the top of transcribe.
+    try:
+        from .transcribe import prewarm as _whisper_prewarm
+        _whisper_prewarm()
+    except Exception:
+        pass
+
     # 1. Download
     _t = time.time()
     progress.begin_stage("download")
