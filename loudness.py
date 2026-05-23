@@ -183,6 +183,11 @@ def analyze(video_path: str, video_id: str, segments: list) -> dict:
         "speech_gap_min_s": SPEECH_GAP_MIN_S,
         "n_speech_gaps": len(speech_gaps),
         "n_silences_audio_only": len(silences_audio),
+        # Per-type silence lists so the visualizer can show audio-detected
+        # silences (orange) separately from transcription-derived speech-gap
+        # silences (yellow). Both go into the final `silences` union list.
+        "silences_audio_only_list": [[round(s, 3), round(e, 3)] for s, e in silences_audio],
+        "silences_speech_gaps_list": [list(g) for g in speech_gaps_filtered],
         "sentence_break_min_s": SENTENCE_BREAK_MIN_S,
         "n_sentence_break_gaps": len(sentence_break_gaps),
         "loud_peak_threshold_db": round(loud_peak_threshold, 1),

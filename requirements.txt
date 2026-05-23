@@ -5,3 +5,4 @@ soundfile>=0.12
 requests>=2.31
 tqdm>=4.65
 smartcut>=1.7
+matplotlib>=3.7

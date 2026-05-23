@@ -9,6 +9,7 @@ from .transcribe import transcribe
 from .loudness import analyze as analyze_loudness
 from .llm import detect_cuts
 from .target import compute_ai_cut_target, estimate_silence_trim_ratio
+from . import stats as _stats
 from .parser import (
     parse_cuts, cuts_to_keeps, snap_cuts_to_silence, trim_silences_within_keeps,
     enforce_budget, extract_highlights_from_response, protect_highlights,
@@ -139,12 +140,19 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
     _announce_cached_stages(out_dir, iteration)
 
     # 1. Download
+    _t = time.time()
     progress.begin_stage("download")
     video_path = download(url, vid)
     progress.end_stage("download")
+    _stats.save(out_dir, "download",
+                elapsed_s=time.time() - _t,
+                url=url, video_id=vid, video_path=video_path,
+                file_size_bytes=os.path.getsize(video_path) if os.path.exists(video_path) else None,
+                source_duration_estimate_s=src_dur_pre)
 
     # Refine again with actual ffprobed duration (metadata duration can be
     # slightly off vs the actual decoded duration).
+    src_dur = None
     try:
         src_dur = _ffprobe_duration(video_path)
         progress.set_source_duration(src_dur)
@@ -152,17 +160,37 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
         pass
 
     # 2. Transcribe
+    _t = time.time()
     progress.begin_stage("transcribe")
     transcript = transcribe(video_path, vid)
     progress.end_stage("transcribe")
     segments = transcript["segments"]
     duration = transcript["duration"]
+    n_words = sum(len(s.get("words") or []) for s in segments)
+    _stats.save(out_dir, "transcribe",
+                elapsed_s=time.time() - _t,
+                duration_s=duration, language=transcript.get("language"),
+                n_segments=len(segments), n_words=n_words,
+                words_per_sec=round(n_words / max(duration, 1e-6), 3))
 
     # 3. Loudness
+    _t = time.time()
     progress.begin_stage("loudness")
     loud = analyze_loudness(video_path, vid, segments)
     progress.end_stage("loudness")
     loud_per_seg = loud["per_segment"]
+    _stats.save(out_dir, "loudness",
+                elapsed_s=time.time() - _t,
+                speech_level_db=loud.get("speech_level_db"),
+                silence_threshold_db=loud.get("silence_threshold_db"),
+                silence_threshold_min_db=loud.get("silence_threshold_min_db"),
+                silence_threshold_max_db=loud.get("silence_threshold_max_db"),
+                n_silences_audio_only=loud.get("n_silences_audio_only"),
+                n_speech_gaps=loud.get("n_speech_gaps"),
+                n_sentence_break_gaps=loud.get("n_sentence_break_gaps"),
+                n_silences_dropped_sentence_break=loud.get("n_silences_dropped_sentence_break"),
+                n_silences_dropped_loud_peak=loud.get("n_silences_dropped_loud_peak"),
+                n_final_silences=len(loud.get("silences", [])))
 
     # 4. LLM cut detection. Dynamic cut target: longer videos go to a smaller
     # final length on a log curve, back-calculated to an AI cut % using the
@@ -177,17 +205,41 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
           f"(floor {target['floor_pct']}%, ceiling {target['ceiling_pct']}%), "
           f"final keep target {target['target_final_keep_pct']}%, "
           f"silence-trim assist ≈ {silence_trim_ratio*100:.1f}%")
+    _t = time.time()
     progress.begin_stage("llm")
     model, raw, primary_raw = detect_cuts(vid, duration, segments, loud_per_seg,
                                           target=target, iteration=iteration,
                                           force_model=force_model)
     progress.end_stage("llm")
+    # llm_iter{N}.json captures the full per-revision response chain;
+    # llm_stats.json captures the high-level summary for the visualizer.
+    try:
+        from .parser import parse_cuts as _parse_cuts
+        _llm_cache = load_json(os.path.join(out_dir, f"llm_iter{iteration}.json"))
+    except Exception:
+        _llm_cache = {}
+    _stats.save(out_dir, "llm",
+                elapsed_s=time.time() - _t,
+                model=model, iteration=iteration,
+                target_pct=target["ai_cut_pct"],
+                floor_pct=target["floor_pct"],
+                ceiling_pct=target["ceiling_pct"],
+                target_final_keep_pct=target["target_final_keep_pct"],
+                silence_trim_ratio_estimate=round(silence_trim_ratio, 4),
+                cut_pct_first=_llm_cache.get("cut_pct_first"),
+                cut_pct_revised=_llm_cache.get("cut_pct_revised"),
+                structure_response_present=bool(_llm_cache.get("structure_response")),
+                revised_response_present=bool(_llm_cache.get("revised_response")),
+                coverage_response_present=bool(_llm_cache.get("coverage_response")),
+                uncovered_response_present=bool(_llm_cache.get("uncovered_response")),
+                final_response_present=bool(_llm_cache.get("final_response")))
 
     # 5. Parse + snap-to-silence + invert.
     # Snap fixes the mid-word-cut / kept-silence problem: the LLM picks cuts
     # against transcript-segment boundaries (which often fall mid-sentence),
     # then we round each boundary to the nearest detected silence within
     # SNAP_TOLERANCE_S. Disable with snap=False to compare A/B.
+    _t_post = time.time()
     progress.begin_stage("post")
     try:
         cuts_raw = parse_cuts(raw, max_duration=duration)
@@ -316,6 +368,18 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
         print(f"[pipeline] expected length after silence trim: {_hms(keep_secs)} "
               f"(was {_hms(duration)}, {100*(1-keep_secs/duration):.1f}% cut)")
     progress.end_stage("post")
+    _stats.save(out_dir, "post",
+                elapsed_s=time.time() - _t_post,
+                n_ai_cuts=len(cuts),
+                ai_cut_seconds=cut_secs,
+                ai_cut_pct=round(pct_cut, 2),
+                n_highlights=len(highlights or []),
+                n_keeps_pre_trim=len(keeps_pre_trim),
+                n_sub_keeps_final=len(keeps),
+                silence_trim_seconds=round(keep_secs_pre - keep_secs, 2) if trim else 0,
+                merge_close_keeps_absorbed_s=round(absorbed_s, 2),
+                merge_close_keeps_n=n_merged_keeps,
+                budget_drop_fired=was_trimmed)
 
     # 6. Cut. One canonical output file, overwritten on each --iter rerun.
     # Per-iter debugging context lives in summary_iter{N}.json beside it.
@@ -328,9 +392,17 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
         # Full-reencode fallback is ~0.10x; observed-rate reports from
         # cutter push the estimate up live if that path runs.
         progress.set_stage_baseline("encode", keep_secs * 0.025)
+        _t_enc = time.time()
         progress.begin_stage("encode")
         cut_video(video_path, keeps, final_path, work_dir=out_dir)
         progress.end_stage("encode")
+        _stats.save(out_dir, "encode",
+                    elapsed_s=time.time() - _t_enc,
+                    n_keep_ranges=len(keeps),
+                    output_seconds=round(keep_secs, 2),
+                    output_path=final_path,
+                    output_size_bytes=os.path.getsize(final_path) if os.path.exists(final_path) else None,
+                    source_size_bytes=os.path.getsize(video_path) if os.path.exists(video_path) else None)
 
     progress.close()
 
@@ -357,6 +429,23 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
         "elapsed_s": round(time.time() - t0, 1),
     }
     save_json(os.path.join(out_dir, f"summary_iter{iteration}.json"), summary)
+
+    # Visualize: always (re)generate pipeline_visual.png. Reads ALL cached
+    # stats + intermediate data files + the freshly-written summary, so it
+    # works even when stages were cache-hit and didn't contribute new stats
+    # this run. Must come AFTER summary_iter is written (viz reads keep_ranges
+    # + keep_total_s from there).
+    _t_viz = time.time()
+    try:
+        from .visualize import render as _render_viz
+        _viz_path = _render_viz(vid)
+        if _viz_path:
+            print(f"[pipeline] visualization: {_viz_path}")
+        _stats.save(out_dir, "visualize",
+                    elapsed_s=time.time() - _t_viz,
+                    output_path=_viz_path)
+    except Exception as e:
+        print(f"[pipeline] visualize failed: {e}")
 
     # End-of-run summary block: before/after timings + cut counts now that
     # we know the actual trimmed output size. Print after `[pipeline] DONE`.

@@ -41,14 +41,16 @@ def cache_dir(video_id: str) -> str:
 # Stage -> list of files to delete when the user double-clicks that .bat.
 # Each value is a list of literal filenames or `del`-compatible glob patterns.
 _UNDO_BATS = {
-    "download":   ["vid_src.mp4"],
-    "transcribe": ["transcribe.json"],
-    "loudness":   ["loudness.json", "loudness_audio.wav"],
-    "llm":        ["llm_iter*.json"],
-    "encode":     ["final.mp4", "summary_iter*.json"],
+    "download":   ["vid_src.mp4", "download_stats.json"],
+    "transcribe": ["transcribe.json", "transcribe_stats.json"],
+    "loudness":   ["loudness.json", "loudness_audio.wav", "loudness_stats.json"],
+    "llm":        ["llm_iter*.json", "llm_stats.json"],
+    "encode":     ["final.mp4", "summary_iter*.json", "encode_stats.json",
+                   "post_stats.json", "pipeline_visual.png"],
     "all": [
         "vid_src.mp4", "transcribe.json", "loudness.json", "loudness_audio.wav",
         "final.mp4", "llm_iter*.json", "summary_iter*.json", "cutter_*",
+        "*_stats.json", "pipeline_visual.png",
     ],
 }
 

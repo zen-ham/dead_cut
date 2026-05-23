@@ -2,6 +2,16 @@
 import argparse
 import sys
 
+# Force utf-8 stdout/stderr so non-ASCII characters in log prints (≈ ≥ → ✓ etc)
+# don't crash on Windows when stdout is redirected (default cp1252 there).
+for _stream in ("stdout", "stderr"):
+    _s = getattr(sys, _stream, None)
+    if _s is not None and hasattr(_s, "reconfigure"):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 from .pipeline import run
 
 
