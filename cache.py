@@ -44,6 +44,8 @@ _UNDO_BATS = {
     "download":   ["vid_src.mp4", "download_stats.json"],
     "transcribe": ["transcribe.json", "transcribe_stats.json"],
     "loudness":   ["loudness.json", "loudness_audio.wav", "loudness_stats.json"],
+    # ^ loudness_audio.wav no longer produced by the streaming loudness path,
+    # but kept in this list so an undo on an old cache still wipes the stale wav.
     "llm":        ["llm_iter*.json", "llm_stats.json"],
     "encode":     ["final.mp4", "final.partial.mp4", "encode_checkpoint.json",
                    "summary_iter*.json", "encode_stats.json", "post_stats.json",

@@ -1,9 +1,10 @@
 """Per-segment loudness annotation. Gives the LLM an entertainment proxy."""
 import os
+import re
 import subprocess
+import threading
 
 import numpy as np
-import soundfile as sf
 from tqdm import tqdm
 
 from .cache import cache_dir, save_json, load_json
@@ -14,39 +15,103 @@ SAMPLE_RATE = 16000  # mono, matches Whisper internal rate
 WINDOW_MS = 100      # 100 ms RMS windows
 
 
-def _extract_wav(video_path: str, wav_path: str, total_secs: float = 0.0, pbar=None) -> None:
-    if os.path.exists(wav_path) and os.path.getsize(wav_path) > 0:
-        if pbar is not None and total_secs > 0:
-            pbar.n = total_secs
-            pbar.refresh()
-        return
+def _stream_db_array(
+    video_path: str, total_secs: float = 0.0, pbar=None,
+) -> tuple[np.ndarray, int]:
+    """Stream ffmpeg PCM (mono int16 @ SAMPLE_RATE) and return (db_array,
+    n_windows) without ever writing audio to disk. Replaces the previous
+    extract-to-wav-then-sf.read pipeline so the large loudness_audio.wav
+    intermediate is gone.
+
+    Memory footprint: the int16 PCM is processed in 100ms-window chunks and
+    discarded after RMS — only the resulting db[] array (4 bytes per 100ms
+    window, ~432KB for a 3hr vod) survives in memory.
+    """
+    win = int(SAMPLE_RATE * WINDOW_MS / 1000)         # 1600 samples per window
+    chunk_windows = 100                                # ~10 s per pipe read
+    chunk_samples = win * chunk_windows
+    chunk_bytes = chunk_samples * 2                    # int16 mono = 2 bytes/sample
+
     cmd = [
-        "ffmpeg", "-y", "-i", video_path,
+        "ffmpeg", "-y", "-i", video_path, "-vn",
         "-ac", "1", "-ar", str(SAMPLE_RATE),
-        "-vn", "-f", "wav",
-        "-progress", "pipe:1", "-nostats",
-        wav_path,
+        "-f", "s16le", "-acodec", "pcm_s16le",
+        "-progress", "pipe:2", "-nostats", "-loglevel", "error",
+        "-",  # pipe PCM to stdout
     ]
-    print(f"[loudness] extracting audio -> {wav_path}")
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-    try:
-        for line in p.stdout:
-            line = line.strip()
-            if not line.startswith("out_time_us="):
-                continue
-            try:
-                cur = int(line.split("=", 1)[1]) / 1e6
-            except (ValueError, IndexError):
-                continue
-            if pbar is not None and total_secs > 0:
+    print(f"[loudness] streaming audio from {os.path.basename(video_path)} "
+          f"(no intermediate wav)")
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        bufsize=8 * 1024 * 1024,
+    )
+
+    # Drain stderr in a thread: parse ffmpeg's -progress out_time_us lines for
+    # the live progress bar, keep the most recent ~8KB of any actual error
+    # output for diagnostics on failure.
+    err_buf: list[bytes] = []
+    progress_re = re.compile(rb"out_time_us=(\d+)")
+
+    def _drain_err() -> None:
+        for line in proc.stderr:
+            m = progress_re.match(line.strip())
+            if m and pbar is not None and total_secs > 0:
+                try:
+                    cur = int(m.group(1)) / 1e6
+                except ValueError:
+                    continue
                 pbar.n = min(cur, float(total_secs))
                 pbar.refresh()
                 progress.report_stage_rate("loudness", min(cur / total_secs, 0.95))
                 progress.tick()
+            else:
+                err_buf.append(line)
+                if sum(len(s) for s in err_buf) > 8000:
+                    err_buf.pop(0)
+
+    drain = threading.Thread(target=_drain_err, daemon=True)
+    drain.start()
+
+    # Read PCM in chunked windows; RMS each window, append to db_list. Tail
+    # samples (< win) at the very end are dropped — same behavior as the
+    # previous code which also truncated to (len(audio) // win) * win.
+    db_chunks: list[np.ndarray] = []
+    leftover = b""
+    try:
+        while True:
+            data = proc.stdout.read(chunk_bytes)
+            if not data:
+                break
+            if leftover:
+                data = leftover + data
+                leftover = b""
+            # Truncate to whole-window boundary; keep the remainder for the
+            # next read (or drop it if EOF, matching old behavior).
+            n_full_windows = len(data) // (win * 2)
+            usable_bytes = n_full_windows * win * 2
+            if usable_bytes < len(data):
+                leftover = data[usable_bytes:]
+                data = data[:usable_bytes]
+            if not data:
+                continue
+            arr = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+            # RMS per window — reshape (n_windows, win), square, mean, sqrt.
+            windows = arr.reshape(-1, win)
+            rms = np.sqrt(np.mean(windows ** 2, axis=1))
+            db_chunks.append(_to_db(rms))
     finally:
-        p.wait()
-    if p.returncode != 0:
-        raise RuntimeError(f"ffmpeg audio extract failed (returncode {p.returncode})")
+        proc.stdout.close()
+        proc.wait(timeout=10)
+        drain.join(timeout=2)
+
+    if proc.returncode != 0:
+        tail = b"".join(err_buf).decode("utf-8", errors="replace")[-1500:]
+        raise RuntimeError(f"ffmpeg audio stream failed (rc={proc.returncode}):\n{tail}")
+
+    if not db_chunks:
+        return np.empty(0, dtype=np.float32), 0
+    db = np.concatenate(db_chunks)
+    return db, int(len(db))
 
 
 def _to_db(rms: np.ndarray, floor_db: float = -90.0) -> np.ndarray:
@@ -63,7 +128,6 @@ def analyze(video_path: str, video_id: str, segments: list) -> dict:
         print(f"[loudness] cache hit: {out_path}")
         return load_json(out_path)
 
-    wav_path = os.path.join(cache_dir(video_id), "loudness_audio.wav")
     # Source duration approx from last segment end. Drives the stage bar
     # during ffmpeg extract (the dominant slow phase, ~80% of stage time).
     total_secs = float(segments[-1]["end"]) if segments else 0.0
@@ -73,17 +137,13 @@ def analyze(video_path: str, video_id: str, segments: list) -> dict:
         bar_format="{desc} {bar} {percentage:3.0f}% | {n:.0f}/{total:.0f}s | eta {remaining}",
         position=1, leave=False,
     )
-    _extract_wav(video_path, wav_path, total_secs=total_secs, pbar=pbar)
+    # Stream PCM directly from ffmpeg → numpy → per-window dB. No wav on disk.
+    # Old `loudness_audio.wav` intermediate is gone; we kept it for years just
+    # to round-trip through soundfile, which was never necessary once the wav
+    # was no longer reused for anything else.
+    db, n_windows = _stream_db_array(video_path, total_secs=total_secs, pbar=pbar)
     progress.report_stage_rate("loudness", 0.85)
     progress.tick()
-
-    audio, sr = sf.read(wav_path, dtype="float32")
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-    win = int(sr * WINDOW_MS / 1000)
-    n_windows = len(audio) // win
-    rms = np.sqrt(np.mean(audio[: n_windows * win].reshape(n_windows, win) ** 2, axis=1))
-    db = _to_db(rms)
     win_secs = WINDOW_MS / 1000.0
     duration = n_windows * win_secs  # audio-derived; matches what the cutter sees
 
