@@ -57,7 +57,7 @@ COLORS = {
 
 def _fmt_secs(s: float | None) -> str:
     if s is None:
-        return "—"
+        return "(cached)"
     if s < 60:
         return f"{s:.1f}s"
     m, sec = divmod(int(round(s)), 60)
@@ -379,10 +379,10 @@ def _draw_time_breakdown(ax, all_stats):
     cached_by = {}
     for s in stages_order:
         st = all_stats.get(s) or {}
-        e = st.get("elapsed_s")
-        if e is None:
+        if not st:
             continue
-        if e < 0.5 or st.get("_cached_this_run"):
+        e = st.get("elapsed_s")
+        if st.get("_cached_this_run") or e is None or e < 0.5:
             cached_by[s] = e
             continue
         elapsed_by[s] = float(e)

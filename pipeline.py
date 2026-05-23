@@ -144,8 +144,12 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
     progress.begin_stage("download")
     video_path = download(url, vid)
     progress.end_stage("download")
+    # elapsed_s passed only when the stage actually ran (> 0.5s). On a
+    # cache hit the stage returns almost instantly and we don't want to
+    # overwrite the real elapsed from when it last ran fresh.
+    _elapsed = time.time() - _t
     _stats.save(out_dir, "download",
-                elapsed_s=time.time() - _t,
+                elapsed_s=_elapsed if _elapsed >= 0.5 else None,
                 url=url, video_id=vid, video_path=video_path,
                 file_size_bytes=os.path.getsize(video_path) if os.path.exists(video_path) else None,
                 source_duration_estimate_s=src_dur_pre)
@@ -167,8 +171,9 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
     segments = transcript["segments"]
     duration = transcript["duration"]
     n_words = sum(len(s.get("words") or []) for s in segments)
+    _elapsed = time.time() - _t
     _stats.save(out_dir, "transcribe",
-                elapsed_s=time.time() - _t,
+                elapsed_s=_elapsed if _elapsed >= 0.5 else None,
                 duration_s=duration, language=transcript.get("language"),
                 n_segments=len(segments), n_words=n_words,
                 words_per_sec=round(n_words / max(duration, 1e-6), 3))
@@ -179,8 +184,9 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
     loud = analyze_loudness(video_path, vid, segments)
     progress.end_stage("loudness")
     loud_per_seg = loud["per_segment"]
+    _elapsed = time.time() - _t
     _stats.save(out_dir, "loudness",
-                elapsed_s=time.time() - _t,
+                elapsed_s=_elapsed if _elapsed >= 0.5 else None,
                 speech_level_db=loud.get("speech_level_db"),
                 silence_threshold_db=loud.get("silence_threshold_db"),
                 silence_threshold_min_db=loud.get("silence_threshold_min_db"),
@@ -218,8 +224,9 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
         _llm_cache = load_json(os.path.join(out_dir, f"llm_iter{iteration}.json"))
     except Exception:
         _llm_cache = {}
+    _elapsed = time.time() - _t
     _stats.save(out_dir, "llm",
-                elapsed_s=time.time() - _t,
+                elapsed_s=_elapsed if _elapsed >= 0.5 else None,
                 model=model, iteration=iteration,
                 target_pct=target["ai_cut_pct"],
                 floor_pct=target["floor_pct"],
@@ -368,8 +375,9 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
         print(f"[pipeline] expected length after silence trim: {_hms(keep_secs)} "
               f"(was {_hms(duration)}, {100*(1-keep_secs/duration):.1f}% cut)")
     progress.end_stage("post")
+    _elapsed = time.time() - _t_post
     _stats.save(out_dir, "post",
-                elapsed_s=time.time() - _t_post,
+                elapsed_s=_elapsed if _elapsed >= 0.5 else None,
                 n_ai_cuts=len(cuts),
                 ai_cut_seconds=cut_secs,
                 ai_cut_pct=round(pct_cut, 2),
@@ -396,8 +404,9 @@ def run(url: str, iteration: int = 0, dry_run: bool = False, force_model: str | 
         progress.begin_stage("encode")
         cut_video(video_path, keeps, final_path, work_dir=out_dir)
         progress.end_stage("encode")
+        _elapsed = time.time() - _t_enc
         _stats.save(out_dir, "encode",
-                    elapsed_s=time.time() - _t_enc,
+                    elapsed_s=_elapsed if _elapsed >= 0.5 else None,
                     n_keep_ranges=len(keeps),
                     output_seconds=round(keep_secs, 2),
                     output_path=final_path,
