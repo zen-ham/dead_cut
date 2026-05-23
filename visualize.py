@@ -111,6 +111,62 @@ def _strip_axis(ax, duration, label):
     ax.set_facecolor(COLORS["track"])
 
 
+def _compute_quality(cuts, duration, target):
+    """Score the AI cut output on 4 pass/fail criteria:
+       in_band:      total cut % within target [floor, ceiling]
+       not_chunked:  no single cut > 15min
+       covered:      largest uncut region < 25% of source
+       balanced:     cuts spread evenly across video quartiles
+                     (stddev / mean of per-quartile count < 0.6)
+    Returns (label, color_hex, checks_dict).
+    """
+    if not cuts or duration <= 0:
+        return "no-data", COLORS["text_dim"], {}
+    cut_total = sum(e - s for s, e in cuts)
+    cut_pct = 100.0 * cut_total / duration
+    in_band = True
+    if target:
+        in_band = target.get("floor_pct", 0) <= cut_pct <= target.get("ceiling_pct", 100)
+    max_cut = max(e - s for s, e in cuts)
+    not_chunked = max_cut <= 900.0  # 15 min absolute
+    # Coverage: longest uncut gap
+    sorted_cuts = sorted(cuts)
+    gaps = [sorted_cuts[0][0]]
+    for i in range(1, len(sorted_cuts)):
+        gaps.append(sorted_cuts[i][0] - sorted_cuts[i - 1][1])
+    gaps.append(duration - sorted_cuts[-1][1])
+    longest_gap = max(gaps)
+    covered = (longest_gap / duration) < 0.25
+    # Balance: count cuts per quartile, compute coefficient of variation
+    n_quartiles = 4
+    q_dur = duration / n_quartiles
+    counts = [0] * n_quartiles
+    for s, _ in cuts:
+        q = min(int(s / q_dur), n_quartiles - 1)
+        counts[q] += 1
+    mean = sum(counts) / n_quartiles
+    if mean > 0:
+        var = sum((c - mean) ** 2 for c in counts) / n_quartiles
+        cov = (var ** 0.5) / mean
+        balanced = cov < 0.6
+    else:
+        balanced = False
+    checks = {
+        "in_band": in_band,
+        "not_chunked": not_chunked,
+        "covered": covered,
+        "balanced": balanced,
+    }
+    passes = sum(checks.values())
+    if passes == 4:
+        return "BALANCED ✓", COLORS["ai_final"], checks
+    if passes == 3:
+        return "OK", "#facc15", checks
+    if passes == 2:
+        return "UNEVEN ⚠", COLORS["audio_silence"], checks
+    return "POOR ✗", "#f85149", checks
+
+
 def _invert_intervals(intervals, duration):
     """Return the complement of `intervals` in [0, duration]."""
     if duration <= 0:
@@ -315,6 +371,35 @@ def render(video_id: str, out_path: str | None = None) -> str | None:
               f"source duration: {_hms(duration)}   |   final cut: {_hms(keep_secs)}   "
               f"({100*keep_secs/duration:.1f}% kept)   |   model: {model}",
               fontsize=9, va="top", color=COLORS["text"])
+
+    # Quality badge — top right. Pass/fail across 4 metrics on the AI cut
+    # output: in-band, not-chunked, well-covered, balanced distribution.
+    ll_stats = all_stats.get("llm") or {}
+    target_for_quality = {
+        "floor_pct": ll_stats.get("floor_pct", 0),
+        "ceiling_pct": ll_stats.get("ceiling_pct", 100),
+    }
+    quality_label, quality_color, quality_checks = _compute_quality(
+        final_cuts, duration, target_for_quality,
+    )
+    # Badge background
+    badge_w, badge_h = 0.18, 0.50
+    badge_x, badge_y = 1.0 - badge_w, 0.45
+    ax_h.add_patch(Rectangle(
+        (badge_x, badge_y), badge_w, badge_h,
+        facecolor=quality_color, edgecolor="none", alpha=0.9,
+    ))
+    ax_h.text(badge_x + badge_w / 2, badge_y + badge_h - 0.10,
+              quality_label, fontsize=11, weight="bold",
+              ha="center", va="top", color=COLORS["bg"])
+    # Check icons under the label
+    if quality_checks:
+        check_line = "   ".join(
+            f"{'✓' if v else '✗'} {k}" for k, v in quality_checks.items()
+        )
+        ax_h.text(badge_x + badge_w / 2, badge_y + 0.08,
+                  check_line, fontsize=7, ha="center", va="bottom",
+                  color=COLORS["bg"])
 
     # ----- Time breakdown bar -----
     ax_b = fig.add_subplot(gs[1])
