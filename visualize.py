@@ -94,6 +94,21 @@ def _draw_intervals(ax, intervals, duration, color, y=0.5, height=0.8, alpha=1.0
                                 facecolor=color, edgecolor="none", alpha=alpha))
 
 
+def _draw_envelope(ax, envelope_db, duration, color, alpha=0.45):
+    """Draw the audio dB envelope as a faint line behind a timeline row.
+    Normalizes dB to [0, 1] (where 1.0 = -10dB, 0 = -60dB) so loud peaks
+    span the full row height. Drawn at high z-order under the intervals."""
+    if not envelope_db or duration <= 0:
+        return
+    import numpy as np
+    arr = np.array(envelope_db, dtype=np.float32)
+    # Normalize dB range -60..-10 → 0..1
+    norm = np.clip((arr - (-60.0)) / 50.0, 0.0, 1.0)
+    xs = np.linspace(0, duration, len(arr))
+    ax.fill_between(xs, 0.05, 0.05 + norm * 0.9, color=color,
+                    alpha=alpha, linewidth=0, zorder=0)
+
+
 def _strip_axis(ax, duration, label):
     ax.set_xlim(0, duration)
     ax.set_ylim(0, 1)
@@ -412,8 +427,13 @@ def render(video_id: str, out_path: str | None = None) -> str | None:
     _draw_details(ax_d, all_stats, loudness, llm_cache, summary, duration)
 
     # ----- Timeline rows -----
+    envelope = (loudness or {}).get("envelope_db") if loudness else None
     for i, (label, intervals, color, alpha) in enumerate(timeline_rows):
         ax = fig.add_subplot(gs[3 + i])
+        # Draw envelope as a faint background ONLY on the audio silences row,
+        # so the user can visually confirm silences land on quiet dB regions.
+        if envelope and label.startswith("audio silences"):
+            _draw_envelope(ax, envelope, duration, COLORS["text_dim"], alpha=0.25)
         _draw_intervals(ax, intervals, duration, color, alpha=alpha)
         _strip_axis(ax, duration, label)
         ax.text(0.998, 0.5, f"n={len(intervals)}", ha="right", va="center",

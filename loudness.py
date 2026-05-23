@@ -167,9 +167,23 @@ def analyze(video_path: str, video_id: str, segments: list) -> dict:
     )
     silences = _union_intervals(silences_audio + speech_gaps_filtered)
 
+    # Downsampled dB envelope for visualizer (max-pool per bucket so peaks
+    # like screams/laughs survive). N=1000 keeps the file small (~6KB) but
+    # gives enough resolution for a smooth plot at typical figure widths.
+    env_n = min(1000, n_windows)
+    if env_n > 0 and n_windows > 0:
+        bucket = max(1, n_windows // env_n)
+        usable = (n_windows // bucket) * bucket
+        envelope_db = db[:usable].reshape(-1, bucket).max(axis=1)
+        envelope = [round(float(v), 1) for v in envelope_db]
+    else:
+        envelope = []
+
     result = {
         "track_mean_db": round(track_mean, 1),
         "track_p90_db": round(track_p90, 1),
+        "envelope_db": envelope,
+        "envelope_window_s": round(duration / max(len(envelope), 1), 4) if envelope else None,
         "speech_level_db": round(speech_level, 1),
         "loud_threshold_db": round(loud_threshold, 1),
         "silence_threshold_db": round(global_silence_threshold, 1),
