@@ -419,7 +419,7 @@ def render(video_id: str, out_path: str | None = None) -> str | None:
     # ----- Time breakdown bar -----
     ax_b = fig.add_subplot(gs[1])
     ax_b.set_facecolor(COLORS["bg"])
-    _draw_time_breakdown(ax_b, all_stats)
+    _draw_time_breakdown(ax_b, all_stats, duration=duration)
 
     # ----- Per-stage details list -----
     ax_d = fig.add_subplot(gs[2])
@@ -435,7 +435,12 @@ def render(video_id: str, out_path: str | None = None) -> str | None:
         if envelope and label.startswith("audio silences"):
             _draw_envelope(ax, envelope, duration, COLORS["text_dim"], alpha=0.25)
         _draw_intervals(ax, intervals, duration, color, alpha=alpha)
-        _strip_axis(ax, duration, label)
+        # Append "X% of src" to the row label so each timeline shows what
+        # fraction of the source the colored bars cover. Reader can interpret
+        # as % cut / % protected / % kept depending on the row's semantics.
+        total_s = sum(e - s for s, e in (intervals or []))
+        pct = 100.0 * total_s / max(duration, 1e-6)
+        _strip_axis(ax, duration, f"{label}\n{pct:.1f}% of src")
         ax.text(0.998, 0.5, f"n={len(intervals)}", ha="right", va="center",
                 transform=ax.transAxes, fontsize=7, color=COLORS["text_dim"])
 
@@ -450,7 +455,12 @@ def render(video_id: str, out_path: str | None = None) -> str | None:
             (speech_trimmed,  COLORS["speech_gap"]),
         ]:
             _draw_intervals(ax_c, src_intervals, duration, color, y=0.4, height=0.5, alpha=0.9)
-        _strip_axis(ax_c, duration, "removed by\n(combined)")
+        combined_s = (sum(e - s for s, e in final_cuts)
+                      + sum(e - s for s, e in audio_trimmed)
+                      + sum(e - s for s, e in speech_trimmed))
+        combined_pct = 100.0 * combined_s / max(duration, 1e-6)
+        _strip_axis(ax_c, duration,
+                    f"removed by\n(combined)\n{combined_pct:.1f}% of src")
         leg_items = [
             ("AI cuts", COLORS["ai_primary"], len(final_cuts)),
             ("audio sil trim", COLORS["audio_silence"], len(audio_trimmed)),
@@ -475,10 +485,24 @@ def render(video_id: str, out_path: str | None = None) -> str | None:
     return out_path
 
 
-def _draw_time_breakdown(ax, all_stats):
+def _fmt_realtime(elapsed_s, duration_s) -> str:
+    """Format a 'Nx realtime' multiplier — how many source seconds were
+    processed per wall second. Empty string when either value is missing or
+    elapsed is sub-second (no meaningful rate)."""
+    if not elapsed_s or not duration_s or elapsed_s < 0.05:
+        return ""
+    rt = duration_s / elapsed_s
+    if rt >= 10:
+        return f"{rt:.0f}x realtime"
+    return f"{rt:.1f}x realtime"
+
+
+def _draw_time_breakdown(ax, all_stats, duration=None):
     """GitHub-style stacked horizontal bar showing % of pipeline time per stage.
     Skips stages that were cached this run (elapsed < 0.5s) so the breakdown
-    represents actual work done in the current pipeline run."""
+    represents actual work done in the current pipeline run.
+    `duration` is the source video duration; when provided, the header also
+    shows the overall pipeline rate vs source length (Nx realtime)."""
     stages_order = ["download", "transcribe", "loudness", "llm", "post", "encode"]
     elapsed_by = {}
     cached_by = {}
@@ -504,8 +528,10 @@ def _draw_time_breakdown(ax, all_stats):
     if cached_by:
         cached_stages_str = ", ".join(cached_by.keys())
         cached_note = f"   |   cached this run: {cached_stages_str}"
+    overall_rt = _fmt_realtime(total, duration)
+    rt_note = f"   |   {overall_rt}" if overall_rt else ""
     ax.text(0.0, 1.05,
-            f"pipeline time breakdown — total {_fmt_secs(total)}{cached_note}",
+            f"pipeline time breakdown — total {_fmt_secs(total)}{rt_note}{cached_note}",
             fontsize=10, weight="bold", va="bottom", color=COLORS["text"])
     cursor = 0.0
     bar_y = 0.55
@@ -542,10 +568,16 @@ def _draw_details(ax, all_stats, loudness, llm_cache, summary, duration):
     ax.set_ylim(0, 1)
     blocks = []  # (title, [lines])
 
+    # Each stage's "Nx realtime" is the source-duration / wall-elapsed
+    # ratio for that stage. Skipped (empty string) on cached/<0.5s stages.
+    def _rt(stats):
+        return _fmt_realtime(stats.get("elapsed_s"), duration)
+
     d_stats = all_stats.get("download") or {}
     if d_stats:
         blocks.append(("download", [
             f"{_fmt_secs(d_stats.get('elapsed_s'))}",
+            _rt(d_stats),
             f"file: {_fmt_bytes(d_stats.get('file_size_bytes'))}",
             f"dur (est): {_hms(d_stats.get('source_duration_estimate_s') or 0)}",
         ]))
@@ -554,6 +586,7 @@ def _draw_details(ax, all_stats, loudness, llm_cache, summary, duration):
     if t_stats:
         blocks.append(("transcribe", [
             f"{_fmt_secs(t_stats.get('elapsed_s'))}",
+            _rt(t_stats),
             f"lang: {t_stats.get('language') or '?'}",
             f"segs: {t_stats.get('n_segments')}, words: {t_stats.get('n_words')}",
             f"{t_stats.get('words_per_sec', 0):.2f} words/s",
@@ -566,6 +599,7 @@ def _draw_details(ax, all_stats, loudness, llm_cache, summary, duration):
             thr_range = f"{l_stats.get('silence_threshold_min_db'):.0f}..{l_stats.get('silence_threshold_max_db'):.0f}dB"
         blocks.append(("loudness", [
             f"{_fmt_secs(l_stats.get('elapsed_s'))}",
+            _rt(l_stats),
             f"speech: {l_stats.get('speech_level_db', '?')}dB",
             f"silence thr: {thr_range}",
             f"audio sil: {l_stats.get('n_silences_audio_only', '?')}",
@@ -584,6 +618,7 @@ def _draw_details(ax, all_stats, loudness, llm_cache, summary, duration):
         if ll_stats.get("uncovered_response_present"): flow.append("uncovered")
         blocks.append(("llm", [
             f"{_fmt_secs(ll_stats.get('elapsed_s'))}",
+            _rt(ll_stats),
             f"model: {(ll_stats.get('model') or '?').split('/')[-1].split(':')[0]}",
             f"target: cut {ll_stats.get('target_pct')}%",
             f"primary: {(ll_stats.get('cut_pct_first') or 0):.1f}% cut",
@@ -594,6 +629,7 @@ def _draw_details(ax, all_stats, loudness, llm_cache, summary, duration):
     if p_stats:
         blocks.append(("post", [
             f"{_fmt_secs(p_stats.get('elapsed_s'))}",
+            _rt(p_stats),
             f"final cuts: {p_stats.get('n_ai_cuts')}",
             f"AI cut: {p_stats.get('ai_cut_pct', 0):.1f}%",
             f"silence trim: {_fmt_secs(p_stats.get('silence_trim_seconds'))}",
@@ -606,12 +642,14 @@ def _draw_details(ax, all_stats, loudness, llm_cache, summary, duration):
     if e_stats:
         blocks.append(("encode", [
             f"{_fmt_secs(e_stats.get('elapsed_s'))}",
+            _rt(e_stats),
             f"output: {_hms(e_stats.get('output_seconds') or 0)}",
             f"size: {_fmt_bytes(e_stats.get('output_size_bytes'))}",
             f"keeps: {e_stats.get('n_keep_ranges')}",
         ]))
 
-    # Layout: blocks side-by-side
+    # Layout: blocks side-by-side. Filter blank lines (e.g. realtime is empty
+    # on cached / sub-second stages) so subsequent stats shift up.
     if not blocks:
         return
     n = len(blocks)
@@ -620,9 +658,13 @@ def _draw_details(ax, all_stats, loudness, llm_cache, summary, duration):
         x = i * block_w
         ax.text(x + 0.005, 0.95, title.upper(), fontsize=9, weight="bold",
                 color=COLORS.get(f"stage_{title}", COLORS["text"]), va="top")
+        lines = [ln for ln in lines if ln]
         for j, ln in enumerate(lines):
+            # Dim "Nx realtime" lines slightly so they read as a sub-stat of
+            # the elapsed line above them, not a peer detail.
+            color = COLORS["text_dim"] if ln.endswith("realtime") else COLORS["text"]
             ax.text(x + 0.005, 0.82 - j * 0.10, ln, fontsize=8,
-                    va="top", color=COLORS["text"])
+                    va="top", color=color)
 
 
 def _load_if(path):
