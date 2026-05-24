@@ -407,10 +407,12 @@ def render(video_id: str, out_path: str | None = None) -> str | None:
     ax_h.text(badge_x + badge_w / 2, badge_y + badge_h - 0.10,
               quality_label, fontsize=11, weight="bold",
               ha="center", va="top", color=COLORS["bg"])
-    # Check icons under the label
+    # Check icons under the label. Single-space separator so the 4 checks
+    # fit inside the badge horizontally (the 3-space version overflowed both
+    # ends at fontsize=7 with the label "balanced" being the widest).
     if quality_checks:
-        check_line = "   ".join(
-            f"{'✓' if v else '✗'} {k}" for k, v in quality_checks.items()
+        check_line = " ".join(
+            f"{'✓' if v else '✗'}{k}" for k, v in quality_checks.items()
         )
         ax_h.text(badge_x + badge_w / 2, badge_y + 0.08,
                   check_line, fontsize=7, ha="center", va="bottom",
