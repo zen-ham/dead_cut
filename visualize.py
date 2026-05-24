@@ -503,7 +503,11 @@ def _draw_time_breakdown(ax, all_stats, duration=None):
     represents actual work done in the current pipeline run.
     `duration` is the source video duration; when provided, the header also
     shows the overall pipeline rate vs source length (Nx realtime)."""
-    stages_order = ["download", "transcribe", "loudness", "llm", "post", "encode"]
+    # Skip "post" entirely — it's a programmatic post-processing step that
+    # always runs in <0.5s and would only clutter the breakdown bar with a
+    # "sub-second: post" annotation that carries no useful information. Its
+    # actual stats (final cut count etc.) are visible in other rows.
+    stages_order = ["download", "transcribe", "loudness", "llm", "encode"]
     elapsed_by = {}
     cached_by = {}   # genuinely a cache-hit this run (had a prior real value)
     fast_by = {}     # ran fresh but in <0.5s (no bar segment, but not cached)
@@ -631,18 +635,9 @@ def _draw_details(ax, all_stats, loudness, llm_cache, summary, duration):
             f"revisions: {' → '.join(flow) if flow else 'none fired'}",
         ]))
 
-    p_stats = all_stats.get("post") or {}
-    if p_stats:
-        blocks.append(("post", [
-            f"{_fmt_secs(p_stats.get('elapsed_s'))}",
-            _rt(p_stats),
-            f"final cuts: {p_stats.get('n_ai_cuts')}",
-            f"AI cut: {p_stats.get('ai_cut_pct', 0):.1f}%",
-            f"silence trim: {_fmt_secs(p_stats.get('silence_trim_seconds'))}",
-            f"sub-keeps: {p_stats.get('n_sub_keeps_final')}",
-            f"merged keeps: {p_stats.get('merge_close_keeps_n')}",
-            f"budget drop: {'fired' if p_stats.get('budget_drop_fired') else 'no'}",
-        ]))
+    # POST block intentionally omitted — it's always sub-second and its
+    # interesting outputs (final cut count, silence trim seconds, sub-keep
+    # count) are already conveyed by the timeline rows + the FINAL keeps row.
 
     e_stats = all_stats.get("encode") or {}
     if e_stats:
