@@ -505,17 +505,21 @@ def _draw_time_breakdown(ax, all_stats, duration=None):
     shows the overall pipeline rate vs source length (Nx realtime)."""
     stages_order = ["download", "transcribe", "loudness", "llm", "post", "encode"]
     elapsed_by = {}
-    cached_by = {}
+    cached_by = {}   # genuinely a cache-hit this run (had a prior real value)
+    fast_by = {}     # ran fresh but in <0.5s (no bar segment, but not cached)
     for s in stages_order:
         st = all_stats.get(s) or {}
         if not st:
             continue
         e = st.get("elapsed_s")
-        if st.get("_cached_this_run") or e is None or e < 0.5:
+        if st.get("_cached_this_run"):
             cached_by[s] = e
             continue
+        if e is None or e < 0.5:
+            fast_by[s] = e
+            continue
         elapsed_by[s] = float(e)
-    if not elapsed_by and not cached_by:
+    if not elapsed_by and not cached_by and not fast_by:
         ax.axis("off")
         ax.text(0.5, 0.5, "no timing data", ha="center", va="center",
                 fontsize=10, color=COLORS["text_dim"])
@@ -524,14 +528,16 @@ def _draw_time_breakdown(ax, all_stats, duration=None):
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.axis("off")
-    cached_note = ""
+    notes = []
     if cached_by:
-        cached_stages_str = ", ".join(cached_by.keys())
-        cached_note = f"   |   cached this run: {cached_stages_str}"
+        notes.append(f"cached this run: {', '.join(cached_by.keys())}")
+    if fast_by:
+        notes.append(f"sub-second: {', '.join(fast_by.keys())}")
+    notes_str = "   |   " + "   |   ".join(notes) if notes else ""
     overall_rt = _fmt_realtime(total, duration)
     rt_note = f"   |   {overall_rt}" if overall_rt else ""
     ax.text(0.0, 1.05,
-            f"pipeline time breakdown — total {_fmt_secs(total)}{rt_note}{cached_note}",
+            f"pipeline time breakdown — total {_fmt_secs(total)}{rt_note}{notes_str}",
             fontsize=10, weight="bold", va="bottom", color=COLORS["text"])
     cursor = 0.0
     bar_y = 0.55
