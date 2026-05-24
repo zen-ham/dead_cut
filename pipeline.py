@@ -3,7 +3,7 @@ import os
 import subprocess
 import time
 
-from .cache import cache_dir, video_id_from_url, save_json
+from .cache import cache_dir, video_id_from_url, save_json, load_json
 from .download import download, fetch_duration
 from .transcribe import transcribe
 from .loudness import analyze as analyze_loudness
