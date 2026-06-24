@@ -1,10 +1,10 @@
 Auto Edit Long YouTube Vods Into Tight Cuts of Just the Entertaining Bits.
 =
 
-![lastcommit](https://img.shields.io/github/last-commit/zen-ham/dead_cut) ![python](https://img.shields.io/badge/python-3.10+-blue) ![ffmpeg](https://img.shields.io/badge/ffmpeg-required-green) ![GPU](https://img.shields.io/badge/NVIDIA_GPU-recommended-76b900)
+![lastcommit](https://img.shields.io/gitlab/last-commit/zenham/dead_cut) ![python](https://img.shields.io/badge/python-3.10+-blue) ![ffmpeg](https://img.shields.io/badge/ffmpeg-required-green) ![GPU](https://img.shields.io/badge/NVIDIA_GPU-recommended-76b900)
 
 <p align="center">
-    <img src="https://github.com/zen-ham/dead_cut/blob/master/repo_assets/logo.svg" width="90%" />
+    <img src="https://gitlab.com/zenham/dead_cut/-/blob/master/repo_assets/logo.svg" width="90%" />
 </p>
 
 ---
@@ -18,7 +18,7 @@ Every run drops a `cuts.json` next to `final.mp4` with the source duration, ever
 Every run also drops a `pipeline_visual.png` showing where every stage's time went, where every detected silence / highlight / AI cut landed on the source timeline, and what got kept vs cut in the final:
 
 <p align="center">
-    <img src="https://github.com/zen-ham/dead_cut/blob/master/repo_assets/pipeline_visual.png" width="100%" />
+    <img src="https://gitlab.com/zenham/dead_cut/-/blob/master/repo_assets/pipeline_visual.png" width="100%" />
 </p>
 
 Pipeline Technical Details:
